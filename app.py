@@ -1,478 +1,656 @@
+"""
+Intrastat Factuur Import App
+Auteur: Lander Smits
+
+Extraheert artikelregels uit aankoopfacturen (PDF), aggregeert per product
+over alle pagina's, en genereert een Intrastat Excel-bestand.
+"""
+
 import io
 import os
 import re
 import uuid
 import logging
+from collections import defaultdict
 from datetime import datetime
 
 import pdfplumber
 import openpyxl
-from openpyxl.styles import (
-    Font, PatternFill, Alignment, Border, Side
-)
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from flask import (
-    Flask, request, jsonify, send_file,
-    render_template, abort
-)
+from flask import Flask, request, jsonify, send_file, render_template, abort
 from werkzeug.utils import secure_filename
 
 # ---------------------------------------------------------------------------
 # App setup
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024  # 20 MB max upload
+app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024  # 20 MB
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-ALLOWED_EXTENSIONS = {"pdf"}
-
-# In-memory store for generated Excel files (keyed by a UUID token)
-RESULT_STORE: dict[str, bytes] = {}
-
-
-def allowed_file(filename: str) -> bool:
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
-
+RESULT_STORE: dict[str, tuple[bytes, str]] = {}
 
 # ---------------------------------------------------------------------------
-# PDF parsing helpers
+# Constants & patterns
 # ---------------------------------------------------------------------------
 
-# Regex patterns (case-insensitive) used to locate header rows in text tables
-SKIP_PATTERNS = re.compile(
-    r"(subtotaal|totaal|btw|vat|discount|korting|verzend|levering|"
-    r"shipping|tax|total|sub-total|total\s+ht|tva|transport|porto)",
+# Units we recognise when splitting "250 kg" into (250, "kg")
+UNITS = [
+    "kg", "g", "gram", "liter", "l", "ml", "stuks", "stuk", "st",
+    "dozen", "doos", "pallet", "pallets", "pak", "pakken",
+    "ton", "t", "m", "m2", "m3", "meter",
+]
+UNIT_RE = re.compile(
+    r"^(\d[\d\s.,]*)[\s\xa0]+(" + "|".join(UNITS) + r")\.?$",
     re.IGNORECASE,
 )
 
-AMOUNT_RE = re.compile(r"[\d\s]{1,10}[.,]\d{2}")
-NUMBER_RE = re.compile(r"^\d+([.,]\d+)?$")
-CODE_RE   = re.compile(r"^[A-Z0-9\-]{3,20}$")
+# Rows to skip (subtotals, transport, VAT, headers, page markers, …)
+SKIP_RE = re.compile(
+    r"(subtotaal|sub-totaal|totaal|total|transport|levering|verzend|"
+    r"btw|vat|tva|korting|discount|intracommunautair|betalings|"
+    r"bladzijde|pagina|page\s*\d|iban|bank|valuta|factuurdatum|"
+    r"leveringsdatum|factuurnummer|klant|leverancier|btw-nummer|"
+    r"^artikel\s*$|^omschrijving\s*$|hoeveelheid\s+eenheid)",
+    re.IGNORECASE,
+)
+
+AMOUNT_RE = re.compile(r"€?\s*(\d[\d.,\s]*\d|\d+)[,.](\d{2})(?!\d)")
+NUMBER_RE = re.compile(r"^\d[\d.,\s]*$")
 
 
-def clean_number(val: str) -> float | None:
-    """Convert European number strings like '1.234,56' or '1234.56' to float."""
+# ---------------------------------------------------------------------------
+# Number helpers
+# ---------------------------------------------------------------------------
+
+def clean_number(val: str | None) -> float | None:
+    """Parse European / US number strings into a Python float."""
     if val is None:
         return None
-    val = str(val).strip().replace(" ", "").replace("\xa0", "")
-    # Remove currency symbols
+    val = str(val).strip().replace("\xa0", "").replace(" ", "")
     val = re.sub(r"[€$£]", "", val)
     if not val:
         return None
-    # European format: 1.234,56
+    # European thousands separator: "1.234,56"
     if re.search(r"\d\.\d{3},", val):
         val = val.replace(".", "").replace(",", ".")
-    # Only comma as decimal: 1234,56
+    # Only comma as decimal: "234,56"
     elif val.count(",") == 1 and val.count(".") == 0:
         val = val.replace(",", ".")
-    # Comma as thousands: 1,234.56
+    # Comma as thousands, dot as decimal: "1,234.56"
     elif val.count(",") >= 1 and val.count(".") == 1:
         val = val.replace(",", "")
+    # Dot as thousands, no decimal: "1.234" → treat as integer
+    elif val.count(".") == 1 and len(val.split(".")[1]) == 3:
+        val = val.replace(".", "")
     try:
         return float(val)
     except ValueError:
         return None
 
 
-def parse_table_rows(table: list[list]) -> list[dict]:
+def split_qty_unit(text: str) -> tuple[float | None, str]:
     """
-    Try to interpret a pdfplumber table as invoice line items.
-    Returns a list of dicts with keys: code, omschrijving, hoeveelheid,
-    eenheid, eenheidsprijs, bedrag.
+    Split a combined quantity-unit string like '250 kg' or '180 stuks'.
+    Returns (quantity_float, unit_string).
+    Falls back to (quantity_float, '') if no unit found.
     """
+    text = text.strip()
+    m = UNIT_RE.match(text)
+    if m:
+        qty = clean_number(m.group(1))
+        unit = m.group(2).lower().rstrip(".")
+        return qty, unit
+
+    # Maybe it's just a plain number
+    num = clean_number(text)
+    if num is not None:
+        return num, ""
+
+    return None, ""
+
+
+# ---------------------------------------------------------------------------
+# Raw line-item extraction
+# ---------------------------------------------------------------------------
+
+def _parse_table_page(table: list[list]) -> list[dict]:
+    """Parse one pdfplumber table into raw line items."""
     if not table or len(table) < 2:
         return []
 
-    # Normalise cells: strip whitespace, replace None with ""
-    rows = []
-    for row in table:
-        rows.append([str(c).strip() if c is not None else "" for c in row])
+    # Normalise cells
+    rows = [[str(c).strip() if c else "" for c in row] for row in table]
 
-    # Detect header row (first row that looks like column titles)
-    header_idx = 0
-    header_keywords = re.compile(
-        r"(omschr|descri|artikel|product|ref|code|qty|hoeveelh|aantal|"
-        r"prijs|price|bedrag|amount|total|eenheid|unit|gewicht|weight)",
+    # Find header row (first row with recognisable column labels)
+    header_kw = re.compile(
+        r"(artikel|product|omschr|descri|ref|code|"
+        r"hoeveelh|aantal|qty|quantit|"
+        r"prijs|price|bedrag|amount|totaal|total|"
+        r"eenheid|unit)",
         re.IGNORECASE,
     )
+    header_idx = 0
     for i, row in enumerate(rows[:5]):
-        if sum(1 for cell in row if header_keywords.search(cell)) >= 2:
+        if sum(1 for c in row if header_kw.search(c)) >= 2:
             header_idx = i
             break
 
-    headers = rows[header_idx]
+    headers = [h.lower() for h in rows[header_idx]]
     data_rows = rows[header_idx + 1:]
 
-    # Map column indices to semantic roles
-    col_map = {
-        "code": None,
-        "omschrijving": None,
-        "hoeveelheid": None,
-        "eenheid": None,
-        "eenheidsprijs": None,
-        "bedrag": None,
-        "cn_code": None,
-        "land": None,
-        "massa": None,
-    }
+    # Map columns
+    def col(patterns, exclude=None):
+        """Return first column index whose header contains any of 'patterns',
+        but NOT any string from 'exclude'."""
+        for i, h in enumerate(headers):
+            if exclude and any(ex in h for ex in exclude):
+                continue
+            for p in patterns:
+                if p in h:
+                    return i
+        return None
 
-    for i, h in enumerate(headers):
-        h_low = h.lower()
-        if re.search(r"omschr|descri|product|goed|artikel\s*naam", h_low):
-            col_map["omschrijving"] = i
-        elif re.search(r"artikel|ref|code|sku|nr\.?$|nr\s", h_low):
-            col_map["code"] = i
-        elif re.search(r"hoeveelh|aantal|qty|quantit", h_low):
-            col_map["hoeveelheid"] = i
-        elif re.search(r"eenheid|unit", h_low):
-            col_map["eenheid"] = i
-        elif re.search(r"eenheidsprijs|stuksprijs|unit\s*price|prijs\s*p", h_low):
-            col_map["eenheidsprijs"] = i
-        elif re.search(r"bedrag|totaal|total|amount|waarde", h_low):
-            col_map["bedrag"] = i
-        elif re.search(r"cn|hs\s*code|goederencode|tarief", h_low):
-            col_map["cn_code"] = i
-        elif re.search(r"land|country|origine|origin", h_low):
-            col_map["land"] = i
-        elif re.search(r"massa|gewicht|weight", h_low):
-            col_map["massa"] = i
-
-    # Heuristic fallback: if no bedrag column found, use last numeric column
-    if col_map["bedrag"] is None and col_map["omschrijving"] is not None:
-        for i in range(len(headers) - 1, -1, -1):
-            if i != col_map.get("hoeveelheid") and i != col_map.get("eenheidsprijs"):
-                col_map["bedrag"] = i
-                break
+    i_art  = col(["artikel", "product", "omschr", "descri", "goed"])
+    i_qty  = col(["hoeveelh", "aantal", "qty", "quantit"])
+    # "eenheid" must NOT match "eenheidsprijs" → exclude price-related headers
+    i_unit = col(["eenheid", "unit"], exclude=["prijs", "price", "waarde", "bedrag"])
+    i_up   = col(["eenheidsprijs", "stuksprijs", "unit price", "prijs p"])
+    i_tot  = col(["totaal", "total", "bedrag", "amount"])
 
     items = []
     for row in data_rows:
         if not any(row):
             continue
-        # Skip totals / summary rows
         combined = " ".join(row)
-        if SKIP_PATTERNS.search(combined):
+        if SKIP_RE.search(combined):
             continue
-        # Skip rows with no numeric value at all
         if not re.search(r"\d", combined):
             continue
 
-        def get(key):
-            idx = col_map.get(key)
-            if idx is not None and idx < len(row):
-                return row[idx]
-            return ""
+        def get(idx):
+            return row[idx] if idx is not None and idx < len(row) else ""
+
+        art_val  = get(i_art)
+        qty_val  = get(i_qty)
+        unit_val = get(i_unit)
+        up_val   = get(i_up)
+        tot_val  = get(i_tot)
+
+        # Always attempt to split quantity column for embedded unit ("250 kg")
+        qty_num, embedded_unit = split_qty_unit(qty_val) if qty_val else (None, "")
+
+        # Prefer dedicated unit column; fall back to embedded unit from qty cell
+        # Reject unit_val that looks like a price (contains digits + comma/dot pattern)
+        if unit_val and not re.search(r"[€$£]|\d+[.,]\d{2}", unit_val):
+            final_unit = unit_val.lower().strip()
+        else:
+            final_unit = embedded_unit  # e.g. "kg" extracted from "250 kg"
 
         item = {
-            "code": get("code"),
-            "omschrijving": get("omschrijving"),
-            "hoeveelheid": clean_number(get("hoeveelheid")),
-            "eenheid": get("eenheid"),
-            "eenheidsprijs": clean_number(get("eenheidsprijs")),
-            "bedrag": clean_number(get("bedrag")),
-            "cn_code": get("cn_code"),
-            "land": get("land"),
-            "massa": clean_number(get("massa")),
+            "artikel":        art_val.strip(),
+            "hoeveelheid":    qty_num,
+            "eenheid":        final_unit,
+            "eenheidsprijs":  clean_number(up_val),
+            "bedrag":         clean_number(tot_val),
         }
 
-        # Only keep row if at least omschrijving OR bedrag is present
-        if item["omschrijving"] or item["bedrag"] is not None:
+        if item["artikel"] or item["bedrag"] is not None:
             items.append(item)
 
     return items
 
 
-def parse_text_fallback(text: str) -> list[dict]:
+def _parse_text_page(text: str) -> list[dict]:
     """
-    Regex-based fallback parser for PDFs without recognisable tables.
-    Looks for lines that contain both a description and at least one amount.
+    Regex fallback: scan plain-text lines for invoice article lines.
+
+    Expected formats (any of):
+      Verse tomaten  250 kg  €2,10  €525,00
+      Verse tomaten  250  kg  2,10  525,00
+      Verse tomaten  250kg  525,00
     """
     items = []
-    lines = text.split("\n")
 
-    for line in lines:
-        line = line.strip()
-        if not line or len(line) < 5:
-            continue
-        if SKIP_PATTERNS.search(line):
-            continue
+    # Build unit alternation for inline regex
+    unit_alt = "|".join(UNITS)
 
-        amounts = AMOUNT_RE.findall(line)
-        if not amounts:
-            continue
+    # Pattern: description  number [unit]  [price]  total
+    LINE_RE = re.compile(
+        r"^(.+?)\s{2,}"                            # description (≥2 spaces after)
+        r"(\d[\d.,]*)[\s\xa0]*"                    # quantity
+        r"(?:(" + unit_alt + r")\.?\s*)?"          # optional unit
+        r"(?:€?\s*\d[\d.,]*\s+)?"                 # optional unit price
+        r"€?\s*(\d[\d.,]+)$",                      # total at end
+        re.IGNORECASE,
+    )
 
-        # Extract the last amount as the line total
-        last_amount = clean_number(amounts[-1])
-        if last_amount is None or last_amount <= 0:
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line or len(line) < 6:
             continue
-
-        # Everything before the first amount is the description
-        first_amt_pos = line.index(amounts[0])
-        description = line[:first_amt_pos].strip()
-        if len(description) < 3:
+        if SKIP_RE.search(line):
             continue
 
-        # Try to extract quantity (first standalone number before description)
-        qty = None
-        qty_match = re.match(r"^(\d+(?:[.,]\d+)?)\s+", description)
-        if qty_match:
-            qty = clean_number(qty_match.group(1))
-            description = description[qty_match.end():].strip()
+        m = LINE_RE.match(line)
+        if m:
+            art  = m.group(1).strip()
+            qty  = clean_number(m.group(2))
+            unit = (m.group(3) or "").lower().strip()
+            tot  = clean_number(m.group(4))
 
-        # Unit price: second-to-last amount if >= 2 amounts
-        unit_price = None
+            if art and (qty is not None or tot is not None):
+                items.append({
+                    "artikel":       art,
+                    "hoeveelheid":   qty,
+                    "eenheid":       unit,
+                    "eenheidsprijs": None,
+                    "bedrag":        tot,
+                })
+            continue
+
+        # Simpler fallback: line with at least 2 amounts and some text
+        amounts = re.findall(r"€?\s*(\d[\d.,]+)", line)
         if len(amounts) >= 2:
-            unit_price = clean_number(amounts[-2])
-
-        items.append(
-            {
-                "code": "",
-                "omschrijving": description,
-                "hoeveelheid": qty,
-                "eenheid": "",
-                "eenheidsprijs": unit_price,
-                "bedrag": last_amount,
-                "cn_code": "",
-                "land": "",
-                "massa": None,
-            }
-        )
+            tot = clean_number(amounts[-1])
+            # Remove amounts from line to get description
+            desc = re.sub(r"€?\s*\d[\d.,]+", "", line).strip()
+            desc = re.sub(r"\s{2,}", " ", desc).strip()
+            if len(desc) >= 3 and tot and tot > 0:
+                items.append({
+                    "artikel":       desc,
+                    "hoeveelheid":   None,
+                    "eenheid":       "",
+                    "eenheidsprijs": None,
+                    "bedrag":        tot,
+                })
 
     return items
 
 
-def extract_invoice_meta(text: str) -> dict:
-    """Pull basic invoice header info from raw text."""
+# ---------------------------------------------------------------------------
+# Main PDF processor
+# ---------------------------------------------------------------------------
+
+def process_pdf(pdf_bytes: bytes) -> tuple[list[dict], dict]:
+    """
+    Parse all pages of a PDF and return:
+      - aggregated list (one entry per unique product, quantities summed)
+      - invoice meta dict
+    """
+    raw_items: list[dict] = []
+    full_text = ""
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page_num, page in enumerate(pdf.pages, start=1):
+            page_text = page.extract_text() or ""
+            full_text += page_text + "\n"
+
+            page_items: list[dict] = []
+
+            # 1. Try table extraction first
+            tables = page.extract_tables()
+            for table in tables:
+                page_items.extend(_parse_table_page(table))
+
+            # 2. If tables yielded nothing, try text parsing
+            if not page_items:
+                page_items = _parse_text_page(page_text)
+
+            # Tag each item with its page number
+            for item in page_items:
+                item["pagina"] = page_num
+
+            raw_items.extend(page_items)
+
+    # Filter items that are clearly not article lines
+    raw_items = [
+        it for it in raw_items
+        if it["artikel"]
+        and not SKIP_RE.search(it["artikel"])
+        and len(it["artikel"]) >= 2
+    ]
+
+    # ── Aggregate by product name ──────────────────────────────────────────
+    # Key = lowercased+stripped article name for case-insensitive grouping
+    groups: dict[str, dict] = {}
+    key_to_canonical: dict[str, str] = {}  # key → original display name
+
+    for item in raw_items:
+        key = re.sub(r"\s+", " ", item["artikel"].lower().strip())
+        if key not in groups:
+            groups[key] = {
+                "artikel":        item["artikel"],   # first seen → canonical name
+                "hoeveelheid":    0.0,
+                "eenheid":        item["eenheid"] or "",
+                "prijzen":        [],                # collect all unit prices
+                "bedrag":         0.0,
+                "paginas":        [],
+                "regels":         0,
+            }
+        g = groups[key]
+        # Accumulate
+        if item["hoeveelheid"] is not None:
+            g["hoeveelheid"] += item["hoeveelheid"]
+        if item["bedrag"] is not None:
+            g["bedrag"] += item["bedrag"]
+        if item["eenheidsprijs"] is not None:
+            g["prijzen"].append(item["eenheidsprijs"])
+        if item["pagina"] not in g["paginas"]:
+            g["paginas"].append(item["pagina"])
+        g["regels"] += 1
+
+    # Build final aggregated list
+    aggregated = []
+    for key, g in groups.items():
+        # Determine eenheidsprijs: use single price or average if varies
+        if g["prijzen"]:
+            avg_price = sum(g["prijzen"]) / len(g["prijzen"])
+            # If all prices are equal, use that; else signal variance
+            if len(set(round(p, 4) for p in g["prijzen"])) == 1:
+                unit_price = g["prijzen"][0]
+                price_note = ""
+            else:
+                unit_price = avg_price
+                price_note = "gem."
+        else:
+            # Derive from total / quantity if possible
+            if g["hoeveelheid"] and g["hoeveelheid"] > 0 and g["bedrag"]:
+                unit_price = g["bedrag"] / g["hoeveelheid"]
+                price_note = "berekend"
+            else:
+                unit_price = None
+                price_note = ""
+
+        aggregated.append({
+            "artikel":        g["artikel"],
+            "hoeveelheid":    g["hoeveelheid"] if g["hoeveelheid"] else None,
+            "eenheid":        g["eenheid"],
+            "eenheidsprijs":  unit_price,
+            "price_note":     price_note,
+            "bedrag":         g["bedrag"] if g["bedrag"] else None,
+            "paginas":        sorted(g["paginas"]),
+            "regels":         g["regels"],
+        })
+
+    # Sort alphabetically by article name
+    aggregated.sort(key=lambda x: x["artikel"].lower())
+
+    # Extract invoice meta from full text
+    meta = _extract_meta(full_text)
+
+    logger.info(
+        "Parsed %d raw lines → %d unique products", len(raw_items), len(aggregated)
+    )
+    return aggregated, meta, raw_items
+
+
+def _extract_meta(text: str) -> dict:
     meta = {"factuurnummer": "", "datum": "", "leverancier": ""}
 
-    inv_match = re.search(
-        r"(factuur\s*(?:nr|nummer|no)?\.?\s*:?\s*)([A-Z0-9\-/]{3,20})",
-        text, re.IGNORECASE
+    m = re.search(
+        r"(factuur\s*(?:nr|nummer|no)?\.?\s*:?\s*)([A-Z0-9\-/]{3,25})",
+        text, re.IGNORECASE,
     )
-    if inv_match:
-        meta["factuurnummer"] = inv_match.group(2).strip()
+    if m:
+        meta["factuurnummer"] = m.group(2).strip()
 
-    date_match = re.search(
-        r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}[./-]\d{2}[./-]\d{2})",
-        text
+    m = re.search(
+        r"(?:factuurdatum|datum)[:\s]+(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})",
+        text, re.IGNORECASE,
     )
-    if date_match:
-        meta["datum"] = date_match.group(1)
+    if not m:
+        m = re.search(
+            r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})", text
+        )
+    if m:
+        meta["datum"] = m.group(1)
 
-    # First non-empty line often contains the supplier name
-    for line in text.split("\n"):
-        line = line.strip()
-        if line and len(line) > 3 and not re.match(r"^(factuur|invoice|rekening)", line, re.IGNORECASE):
-            meta["leverancier"] = line
-            break
+    # Supplier: line after "Leverancier:"
+    m = re.search(r"leverancier\s*:\s*(.+)", text, re.IGNORECASE)
+    if m:
+        meta["leverancier"] = m.group(1).strip()
+    else:
+        for line in text.split("\n"):
+            line = line.strip()
+            if line and len(line) > 4 and not re.match(
+                r"^(aankoopfactuur|invoice|factuur|bladzijde|pagina)",
+                line, re.IGNORECASE
+            ):
+                meta["leverancier"] = line
+                break
 
     return meta
 
 
-def process_pdf(pdf_bytes: bytes) -> tuple[list[dict], dict]:
-    """
-    Main entry point: parse a PDF and return (line_items, meta).
-    Tries table extraction per page first; falls back to text parsing.
-    """
-    items: list[dict] = []
-    full_text = ""
-
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            # 1. Table extraction
-            tables = page.extract_tables()
-            for table in tables:
-                rows = parse_table_rows(table)
-                items.extend(rows)
-
-            # 2. Accumulate text for meta + fallback
-            page_text = page.extract_text() or ""
-            full_text += page_text + "\n"
-
-    # If table extraction found nothing meaningful, use text fallback
-    if not items:
-        logger.info("No table items found, using text fallback parser")
-        items = parse_text_fallback(full_text)
-
-    # Deduplicate identical rows
-    seen = set()
-    unique_items = []
-    for item in items:
-        key = (item.get("omschrijving", ""), item.get("bedrag"))
-        if key not in seen:
-            seen.add(key)
-            unique_items.append(item)
-
-    meta = extract_invoice_meta(full_text)
-    return unique_items, meta
-
-
 # ---------------------------------------------------------------------------
-# Excel generation
+# Excel builder
 # ---------------------------------------------------------------------------
 
-HEADER_BG   = "8B7355"   # warm brown
-ALT_ROW_BG  = "F5F0E8"   # light beige
-WHITE       = "FAFAF7"
-BORDER_CLR  = "D4C5A9"
-TOTAL_BG    = "C9A96E"   # golden beige
+BROWN       = "8B7355"
+BEIGE_ALT   = "F5F0E8"
+BEIGE_WHITE = "FEFCF9"
+BEIGE_DARK  = "D4C5A9"
+GOLD        = "C9A96E"
+GREEN       = "4A7A3E"
+BLUE_GREY   = "6B7E8F"
 
 
-def _thin_border(color=BORDER_CLR):
-    side = Side(style="thin", color=color)
-    return Border(left=side, right=side, top=side, bottom=side)
+def _border(color=BEIGE_DARK):
+    s = Side(style="thin", color=color)
+    return Border(left=s, right=s, top=s, bottom=s)
 
 
-def build_excel(items: list[dict], meta: dict, filename: str) -> bytes:
-    """Generate a styled Intrastat Excel workbook and return as bytes."""
+def _hdr_cell(ws, row, col, value, width=None):
+    c = ws.cell(row=row, column=col, value=value)
+    c.font  = Font(bold=True, color="FFFFFF", size=10)
+    c.fill  = PatternFill("solid", fgColor=BROWN)
+    c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    c.border = _border("FFFFFF")
+    if width and ws.column_dimensions[get_column_letter(col)].width < width:
+        ws.column_dimensions[get_column_letter(col)].width = width
+    return c
+
+
+def build_excel(aggregated: list[dict], meta: dict, raw_items: list[dict]) -> bytes:
     wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Intrastat"
 
-    # ── Title block ──────────────────────────────────────────────────────────
-    ws.merge_cells("A1:I1")
-    title_cell = ws["A1"]
-    title_cell.value = "Intrastat – Aankoopfacturen"
-    title_cell.font = Font(bold=True, size=14, color="FFFFFF")
-    title_cell.fill = PatternFill("solid", fgColor=HEADER_BG)
-    title_cell.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 28
+    # ── Sheet 1: Totalen per product ──────────────────────────────────────
+    ws1 = wb.active
+    ws1.title = "Totalen per product"
+    _build_summary_sheet(ws1, aggregated, meta)
 
-    # Meta row
-    ws.merge_cells("A2:C2")
-    ws["A2"].value = f"Leverancier: {meta.get('leverancier', '')}"
-    ws.merge_cells("D2:F2")
-    ws["D2"].value = f"Factuurnummer: {meta.get('factuurnummer', '')}"
-    ws.merge_cells("G2:I2")
-    ws["G2"].value = f"Datum: {meta.get('datum', '')}   |   Export: {datetime.today().strftime('%d/%m/%Y')}"
-    for col in ["A2", "D2", "G2"]:
-        cell = ws[col]
-        cell.font = Font(italic=True, size=10, color="5C4A32")
-        cell.fill = PatternFill("solid", fgColor="EDE5D0")
-        cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
-    ws.row_dimensions[2].height = 18
+    # ── Sheet 2: Detail (alle ruwe regels) ────────────────────────────────
+    ws2 = wb.create_sheet("Detail per pagina")
+    _build_detail_sheet(ws2, raw_items, meta)
 
-    ws.append([])  # blank row
-
-    # ── Column headers ───────────────────────────────────────────────────────
-    COLUMNS = [
-        ("Artikelcode",        14),
-        ("Omschrijving",       38),
-        ("Goederencode (CN)",  18),
-        ("Land v. Oorsprong",  18),
-        ("Hoeveelheid",        13),
-        ("Eenheid",            10),
-        ("Netto massa (kg)",   16),
-        ("Eenheidsprijs (€)",  16),
-        ("Factuurwaarde (€)",  18),
-    ]
-
-    header_fill = PatternFill("solid", fgColor=HEADER_BG)
-    header_font = Font(bold=True, color="FFFFFF", size=10)
-    header_row = 4
-
-    for col_idx, (label, width) in enumerate(COLUMNS, start=1):
-        cell = ws.cell(row=header_row, column=col_idx, value=label)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = _thin_border("FFFFFF")
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
-    ws.row_dimensions[header_row].height = 30
-
-    # ── Data rows ────────────────────────────────────────────────────────────
-    data_start = header_row + 1
-    number_fmt = '#,##0.00 "€"'
-    qty_fmt    = '#,##0.##'
-
-    for row_idx, item in enumerate(items):
-        r = data_start + row_idx
-        fill_color = ALT_ROW_BG if row_idx % 2 == 0 else WHITE
-        row_fill = PatternFill("solid", fgColor=fill_color)
-        border = _thin_border()
-
-        values = [
-            item.get("code", ""),
-            item.get("omschrijving", ""),
-            item.get("cn_code", ""),
-            item.get("land", ""),
-            item.get("hoeveelheid"),
-            item.get("eenheid", ""),
-            item.get("massa"),
-            item.get("eenheidsprijs"),
-            item.get("bedrag"),
-        ]
-
-        for col_idx, val in enumerate(values, start=1):
-            cell = ws.cell(row=r, column=col_idx, value=val)
-            cell.fill = row_fill
-            cell.border = border
-            cell.alignment = Alignment(vertical="center", wrap_text=(col_idx == 2))
-
-            # Numeric formatting
-            if col_idx in (5, 7):   # qty / massa
-                if isinstance(val, (int, float)):
-                    cell.number_format = qty_fmt
-            if col_idx in (8, 9):   # prices
-                if isinstance(val, (int, float)):
-                    cell.number_format = number_fmt
-
-        ws.row_dimensions[r].height = 18
-
-    # ── Totals row ───────────────────────────────────────────────────────────
-    total_row = data_start + len(items)
-    total_fill = PatternFill("solid", fgColor=TOTAL_BG)
-    total_font = Font(bold=True, size=10, color="3D3229")
-
-    ws.cell(row=total_row, column=1, value="TOTAAL").font  = total_font
-    ws.cell(row=total_row, column=1).fill = total_fill
-    ws.cell(row=total_row, column=1).border = _thin_border()
-
-    for col in range(2, 10):
-        cell = ws.cell(row=total_row, column=col)
-        cell.fill = total_fill
-        cell.border = _thin_border()
-        cell.font = total_font
-
-    # SUM formulas for numeric columns
-    if items:
-        for col_idx, fmt in [(5, qty_fmt), (7, qty_fmt), (8, number_fmt), (9, number_fmt)]:
-            col_letter = get_column_letter(col_idx)
-            sum_cell = ws.cell(row=total_row, column=col_idx)
-            sum_cell.value = f"=SUM({col_letter}{data_start}:{col_letter}{total_row - 1})"
-            sum_cell.number_format = fmt
-            sum_cell.font = total_font
-            sum_cell.fill = total_fill
-            sum_cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    ws.row_dimensions[total_row].height = 22
-
-    # ── Freeze panes & auto-filter ───────────────────────────────────────────
-    ws.freeze_panes = ws.cell(row=data_start, column=1)
-    ws.auto_filter.ref = (
-        f"A{header_row}:{get_column_letter(len(COLUMNS))}{total_row - 1}"
-    )
-
-    # ── Footer note ──────────────────────────────────────────────────────────
-    note_row = total_row + 2
-    ws.merge_cells(f"A{note_row}:I{note_row}")
-    note_cell = ws[f"A{note_row}"]
-    note_cell.value = (
-        f"Gegenereerd door Intrastat Factuur App  •  {datetime.today().strftime('%d/%m/%Y %H:%M')}  •  © Lander Smits"
-    )
-    note_cell.font = Font(italic=True, size=8, color="9C8567")
-    note_cell.alignment = Alignment(horizontal="center")
-
-    # ── Save to bytes ─────────────────────────────────────────────────────────
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
     return buf.read()
 
 
+def _build_summary_sheet(ws, aggregated, meta):
+    # Title
+    ws.merge_cells("A1:H1")
+    t = ws["A1"]
+    t.value = "Intrastat – Totalen per product"
+    t.font  = Font(bold=True, size=14, color="FFFFFF")
+    t.fill  = PatternFill("solid", fgColor=BROWN)
+    t.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 30
+
+    # Meta
+    def meta_cell(rng, val):
+        ws.merge_cells(rng)
+        start = rng.split(":")[0]
+        c = ws[start]
+        c.value = val
+        c.font  = Font(italic=True, size=9, color="5C4A32")
+        c.fill  = PatternFill("solid", fgColor="EDE5D0")
+        c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+
+    meta_cell("A2:C2", f"Leverancier: {meta.get('leverancier','')}")
+    meta_cell("D2:F2", f"Factuurnummer: {meta.get('factuurnummer','')}")
+    meta_cell("G2:H2", f"Datum: {meta.get('datum','')}  |  Export: {datetime.today().strftime('%d/%m/%Y')}")
+    ws.row_dimensions[2].height = 16
+
+    ws.append([])  # blank row
+
+    # Headers (row 4)
+    COLS = [
+        ("Product / Artikel",        32),
+        ("Totale hoeveelheid",       18),
+        ("Eenheid",                  10),
+        ("Eenheidsprijs (€)",        16),
+        ("Totale waarde (€)",        18),
+        ("Verschijnt op pagina's",   22),
+        ("Aantal regels",            13),
+        ("Notitie prijs",            13),
+    ]
+    HR = 4
+    for ci, (label, w) in enumerate(COLS, 1):
+        _hdr_cell(ws, HR, ci, label, w)
+    ws.row_dimensions[HR].height = 32
+
+    # Data
+    DS = HR + 1
+    fmt_qty  = '#,##0.##'
+    fmt_eur  = '#,##0.00 "€"'
+
+    for ri, item in enumerate(aggregated):
+        r = DS + ri
+        fill = PatternFill("solid", fgColor=BEIGE_ALT if ri % 2 == 0 else BEIGE_WHITE)
+        brd  = _border()
+
+        paginas_str = ", ".join(str(p) for p in item["paginas"])
+
+        vals = [
+            item["artikel"],
+            item["hoeveelheid"],
+            item["eenheid"],
+            item["eenheidsprijs"],
+            item["bedrag"],
+            paginas_str,
+            item["regels"],
+            item["price_note"],
+        ]
+
+        for ci, v in enumerate(vals, 1):
+            c = ws.cell(row=r, column=ci, value=v)
+            c.fill   = fill
+            c.border = brd
+            c.alignment = Alignment(vertical="center", wrap_text=(ci == 1))
+            if ci == 2 and isinstance(v, (int, float)):
+                c.number_format = fmt_qty
+            if ci in (4, 5) and isinstance(v, (int, float)):
+                c.number_format = fmt_eur
+
+        ws.row_dimensions[r].height = 18
+
+    # Totals row
+    TR = DS + len(aggregated)
+    tot_fill = PatternFill("solid", fgColor=GOLD)
+    tot_font = Font(bold=True, size=10)
+
+    for ci in range(1, 9):
+        c = ws.cell(row=TR, column=ci)
+        c.fill   = tot_fill
+        c.border = _border()
+        c.font   = tot_font
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    ws.cell(row=TR, column=1, value="TOTAAL")
+    # Sum total waarde
+    col_e = get_column_letter(5)
+    ws.cell(row=TR, column=5).value = f"=SUM({col_e}{DS}:{col_e}{TR-1})"
+    ws.cell(row=TR, column=5).number_format = fmt_eur
+    ws.cell(row=TR, column=7).value = f"=SUM(G{DS}:G{TR-1})"
+    ws.row_dimensions[TR].height = 22
+
+    # Freeze & filter
+    ws.freeze_panes = ws.cell(row=DS, column=1)
+    ws.auto_filter.ref = f"A{HR}:{get_column_letter(len(COLS))}{TR-1}"
+
+    # Footer
+    nr = TR + 2
+    ws.merge_cells(f"A{nr}:H{nr}")
+    fc = ws[f"A{nr}"]
+    fc.value = (
+        f"Gegenereerd door Intrastat Factuur App  •  "
+        f"{datetime.today().strftime('%d/%m/%Y %H:%M')}  •  © Lander Smits"
+    )
+    fc.font = Font(italic=True, size=8, color="9C8567")
+    fc.alignment = Alignment(horizontal="center")
+
+
+def _build_detail_sheet(ws, raw_items, meta):
+    ws.merge_cells("A1:G1")
+    t = ws["A1"]
+    t.value = "Detail – alle regels per pagina"
+    t.font  = Font(bold=True, size=12, color="FFFFFF")
+    t.fill  = PatternFill("solid", fgColor=BLUE_GREY)
+    t.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 26
+
+    ws.append([])
+
+    COLS = [
+        ("Pagina",                8),
+        ("Product / Artikel",    32),
+        ("Hoeveelheid",          14),
+        ("Eenheid",              10),
+        ("Eenheidsprijs (€)",    16),
+        ("Bedrag (€)",           14),
+    ]
+    HR = 3
+    for ci, (label, w) in enumerate(COLS, 1):
+        c = ws.cell(row=HR, column=ci, value=label)
+        c.font  = Font(bold=True, color="FFFFFF", size=10)
+        c.fill  = PatternFill("solid", fgColor=BLUE_GREY)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = _border("FFFFFF")
+        ws.column_dimensions[get_column_letter(ci)].width = w
+    ws.row_dimensions[HR].height = 28
+
+    DS = HR + 1
+    fmt_eur = '#,##0.00 "€"'
+    fmt_qty = '#,##0.##'
+
+    for ri, item in enumerate(raw_items):
+        r = DS + ri
+        fill = PatternFill("solid", fgColor=BEIGE_ALT if ri % 2 == 0 else BEIGE_WHITE)
+        brd  = _border()
+
+        vals = [
+            item.get("pagina"),
+            item.get("artikel"),
+            item.get("hoeveelheid"),
+            item.get("eenheid"),
+            item.get("eenheidsprijs"),
+            item.get("bedrag"),
+        ]
+
+        for ci, v in enumerate(vals, 1):
+            c = ws.cell(row=r, column=ci, value=v)
+            c.fill   = fill
+            c.border = brd
+            c.alignment = Alignment(vertical="center", horizontal="center" if ci in (1, 3, 4) else "left")
+            if ci == 3 and isinstance(v, (int, float)):
+                c.number_format = fmt_qty
+            if ci in (5, 6) and isinstance(v, (int, float)):
+                c.number_format = fmt_eur
+
+        ws.row_dimensions[r].height = 16
+
+    ws.freeze_panes = ws.cell(row=DS, column=1)
+    ws.auto_filter.ref = f"A{HR}:{get_column_letter(len(COLS))}{DS + len(raw_items) - 1}"
+
+
 # ---------------------------------------------------------------------------
-# Routes
+# Flask routes
 # ---------------------------------------------------------------------------
 
 @app.route("/")
@@ -486,46 +664,45 @@ def upload():
         return jsonify({"error": "Geen bestand ontvangen."}), 400
 
     file = request.files["pdf"]
-    if file.filename == "" or not allowed_file(file.filename):
-        return jsonify({"error": "Ongeldig bestandstype. Upload een PDF-bestand."}), 400
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        return jsonify({"error": "Upload een geldig PDF-bestand."}), 400
 
     pdf_bytes = file.read()
-    if len(pdf_bytes) == 0:
-        return jsonify({"error": "Het geüploade bestand is leeg."}), 400
+    if not pdf_bytes:
+        return jsonify({"error": "Het bestand is leeg."}), 400
 
     try:
-        items, meta = process_pdf(pdf_bytes)
+        aggregated, meta, raw_items = process_pdf(pdf_bytes)
     except Exception as exc:
-        logger.exception("PDF parsing failed")
-        return jsonify({"error": f"Fout bij het verwerken van de PDF: {exc}"}), 500
+        logger.exception("PDF verwerking mislukt")
+        return jsonify({"error": f"Fout bij verwerken: {exc}"}), 500
 
-    if not items:
+    if not aggregated:
         return jsonify({
             "error": (
-                "Geen artikelregels gevonden in de PDF. "
-                "Controleer of de factuur leesbare tekst of tabellen bevat."
+                "Geen artikelregels gevonden. Controleer of de PDF leesbare "
+                "tekst bevat (niet enkel gescande afbeeldingen)."
             )
         }), 422
 
-    # Build Excel
-    safe_name = secure_filename(file.filename).replace(".pdf", "")
-    excel_filename = f"intrastat_{safe_name}_{datetime.today().strftime('%Y%m%d')}.xlsx"
+    safe = secure_filename(file.filename).replace(".pdf", "")
+    xlsx_name = f"intrastat_{safe}_{datetime.today().strftime('%Y%m%d')}.xlsx"
 
     try:
-        excel_bytes = build_excel(items, meta, excel_filename)
+        excel_bytes = build_excel(aggregated, meta, raw_items)
     except Exception as exc:
-        logger.exception("Excel generation failed")
-        return jsonify({"error": f"Fout bij het aanmaken van het Excel-bestand: {exc}"}), 500
+        logger.exception("Excel aanmaken mislukt")
+        return jsonify({"error": f"Excel fout: {exc}"}), 500
 
-    # Store result in memory with a unique token
     token = str(uuid.uuid4())
-    RESULT_STORE[token] = (excel_bytes, excel_filename)
+    RESULT_STORE[token] = (excel_bytes, xlsx_name)
 
     return jsonify({
-        "token": token,
-        "filename": excel_filename,
-        "item_count": len(items),
-        "meta": meta,
+        "token":       token,
+        "filename":    xlsx_name,
+        "item_count":  len(aggregated),
+        "raw_count":   len(raw_items),
+        "meta":        meta,
     })
 
 
@@ -534,7 +711,6 @@ def download(token: str):
     result = RESULT_STORE.pop(token, None)
     if result is None:
         abort(404)
-
     excel_bytes, filename = result
     return send_file(
         io.BytesIO(excel_bytes),

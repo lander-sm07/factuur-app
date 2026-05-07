@@ -473,7 +473,7 @@
               <polyline points="7,10 12,15 17,10"/>
               <line x1="12" y1="15" x2="12" y2="3"/>
             </svg>
-            Download Intrastat Excel
+            Download Intrastat Excel (2 tabbladen)
           </a>
           <button id="new-upload-btn">↩ Nieuwe factuur uploaden</button>
         </div>
@@ -604,10 +604,11 @@
     // ── Meta display ───────────────────────────────────────────────────────
     function renderMeta(data) {
       const items = [
-        { label: 'Artikelregels',  value: data.item_count },
-        { label: 'Leverancier',    value: data.meta?.leverancier || '—' },
-        { label: 'Factuurnummer',  value: data.meta?.factuurnummer || '—' },
-        { label: 'Datum factuur',  value: data.meta?.datum || '—' },
+        { label: 'Unieke producten',  value: data.item_count },
+        { label: 'Regels in PDF',     value: data.raw_count },
+        { label: 'Leverancier',       value: data.meta?.leverancier || '—' },
+        { label: 'Factuurnummer',     value: data.meta?.factuurnummer || '—' },
+        { label: 'Datum factuur',     value: data.meta?.datum || '—' },
       ];
       resultMeta.innerHTML = items.map(i => `
         <div class="meta-item">
