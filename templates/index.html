@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Intrastat Factuur Import</title>
+  <style>
+    /* ── Reset & base ──────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --beige-light:  #f7f2ea;
+      --beige-mid:    #ede5d3;
+      --beige-dark:   #d4c5a9;
+      --brown-light:  #c9a96e;
+      --brown:        #8b7355;
+      --brown-dark:   #5c4a32;
+      --text:         #3d3229;
+      --text-muted:   #7a6a56;
+      --white:        #fefcf9;
+      --success:      #5a7a4e;
+      --error:        #9b3a3a;
+      --radius:       12px;
+      --shadow:       0 4px 24px rgba(61,50,41,0.10);
+    }
+
+    html, body {
+      height: 100%;
+      font-family: 'Georgia', 'Times New Roman', serif;
+      background: var(--beige-light);
+      color: var(--text);
+    }
+
+    body {
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+
+    /* ── Header ─────────────────────────────────────────────────────────────── */
+    header {
+      background: var(--brown);
+      color: var(--white);
+      padding: 28px 24px 22px;
+      text-align: center;
+      box-shadow: 0 2px 12px rgba(61,50,41,0.18);
+    }
+
+    header h1 {
+      font-size: 2rem;
+      font-weight: normal;
+      letter-spacing: 0.04em;
+    }
+
+    header p {
+      margin-top: 6px;
+      font-size: 0.95rem;
+      color: var(--beige-mid);
+      font-style: italic;
+    }
+
+    /* ── Main content ────────────────────────────────────────────────────────── */
+    main {
+      flex: 1;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 48px 20px 60px;
+    }
+
+    .card {
+      background: var(--white);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      border: 1px solid var(--beige-dark);
+      width: 100%;
+      max-width: 660px;
+      padding: 40px 44px;
+    }
+
+    /* ── Upload zone ─────────────────────────────────────────────────────────── */
+    .upload-label {
+      display: block;
+      cursor: pointer;
+    }
+
+    .drop-zone {
+      border: 2.5px dashed var(--beige-dark);
+      border-radius: var(--radius);
+      background: var(--beige-light);
+      padding: 52px 24px;
+      text-align: center;
+      transition: border-color 0.2s, background 0.2s;
+    }
+
+    .drop-zone.drag-over {
+      border-color: var(--brown-light);
+      background: var(--beige-mid);
+    }
+
+    .drop-zone svg {
+      display: block;
+      margin: 0 auto 18px;
+      opacity: 0.55;
+    }
+
+    .drop-zone .hint {
+      font-size: 1.05rem;
+      color: var(--brown-dark);
+      font-weight: bold;
+    }
+
+    .drop-zone .sub-hint {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      margin-top: 6px;
+      font-style: italic;
+    }
+
+    #file-input { display: none; }
+
+    /* Selected file pill */
+    #file-pill {
+      display: none;
+      margin-top: 14px;
+      align-items: center;
+      gap: 10px;
+      background: var(--beige-mid);
+      border-radius: 40px;
+      padding: 8px 16px;
+      font-size: 0.9rem;
+      color: var(--brown-dark);
+    }
+
+    #file-pill svg { flex-shrink: 0; }
+    #file-pill span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    #remove-file {
+      background: none;
+      border: none;
+      cursor: pointer;
+      color: var(--text-muted);
+      padding: 0;
+      line-height: 1;
+      font-size: 1.1rem;
+    }
+
+    #remove-file:hover { color: var(--error); }
+
+    /* ── Submit button ───────────────────────────────────────────────────────── */
+    #submit-btn {
+      margin-top: 28px;
+      width: 100%;
+      padding: 15px;
+      background: var(--brown);
+      color: var(--white);
+      border: none;
+      border-radius: var(--radius);
+      font-size: 1.05rem;
+      font-family: inherit;
+      cursor: pointer;
+      letter-spacing: 0.03em;
+      transition: background 0.2s, transform 0.1s;
+    }
+
+    #submit-btn:hover:not(:disabled) {
+      background: var(--brown-dark);
+    }
+
+    #submit-btn:active:not(:disabled) {
+      transform: scale(0.98);
+    }
+
+    #submit-btn:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    /* ── Progress section ────────────────────────────────────────────────────── */
+    #progress-section {
+      display: none;
+      margin-top: 32px;
+      text-align: center;
+    }
+
+    .spinner-wrap {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .spinner {
+      width: 52px;
+      height: 52px;
+      border: 5px solid var(--beige-dark);
+      border-top-color: var(--brown);
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    .progress-bar-wrap {
+      width: 100%;
+      background: var(--beige-mid);
+      border-radius: 40px;
+      height: 8px;
+      overflow: hidden;
+      margin-top: 4px;
+    }
+
+    .progress-bar {
+      height: 100%;
+      background: linear-gradient(90deg, var(--brown-light), var(--brown));
+      border-radius: 40px;
+      width: 0%;
+      transition: width 0.4s ease;
+    }
+
+    .progress-steps {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 12px;
+      text-align: left;
+      font-size: 0.88rem;
+      color: var(--text-muted);
+    }
+
+    .step { display: flex; align-items: center; gap: 8px; opacity: 0.4; transition: opacity 0.3s; }
+    .step.active { opacity: 1; color: var(--brown-dark); }
+    .step.done { opacity: 0.75; color: var(--success); }
+    .step .dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: var(--beige-dark);
+      flex-shrink: 0;
+      transition: background 0.3s;
+    }
+    .step.active .dot { background: var(--brown-light); }
+    .step.done .dot { background: var(--success); }
+
+    /* ── Result section ──────────────────────────────────────────────────────── */
+    #result-section {
+      display: none;
+      margin-top: 32px;
+    }
+
+    .result-box {
+      border: 1.5px solid var(--beige-dark);
+      border-radius: var(--radius);
+      padding: 24px;
+      background: var(--beige-light);
+    }
+
+    .result-box h2 {
+      font-size: 1.1rem;
+      color: var(--success);
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .result-meta {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+
+    .meta-item {
+      background: var(--white);
+      border-radius: 8px;
+      border: 1px solid var(--beige-dark);
+      padding: 10px 14px;
+    }
+
+    .meta-item .label {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-style: italic;
+    }
+
+    .meta-item .value {
+      font-size: 1rem;
+      font-weight: bold;
+      color: var(--brown-dark);
+      margin-top: 2px;
+    }
+
+    #download-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      width: 100%;
+      padding: 14px;
+      background: var(--success);
+      color: var(--white);
+      border: none;
+      border-radius: var(--radius);
+      font-size: 1rem;
+      font-family: inherit;
+      cursor: pointer;
+      text-decoration: none;
+      letter-spacing: 0.02em;
+      transition: background 0.2s;
+    }
+
+    #download-btn:hover { background: #4a6940; }
+
+    #new-upload-btn {
+      margin-top: 12px;
+      width: 100%;
+      padding: 10px;
+      background: none;
+      color: var(--text-muted);
+      border: 1.5px solid var(--beige-dark);
+      border-radius: var(--radius);
+      font-size: 0.9rem;
+      font-family: inherit;
+      cursor: pointer;
+      transition: border-color 0.2s, color 0.2s;
+    }
+
+    #new-upload-btn:hover { border-color: var(--brown-light); color: var(--brown); }
+
+    /* ── Error box ───────────────────────────────────────────────────────────── */
+    #error-box {
+      display: none;
+      margin-top: 20px;
+      padding: 16px 20px;
+      background: #fdf0f0;
+      border: 1.5px solid #d9a0a0;
+      border-radius: var(--radius);
+      color: var(--error);
+      font-size: 0.92rem;
+    }
+
+    /* ── Divider ─────────────────────────────────────────────────────────────── */
+    .divider {
+      border: none;
+      border-top: 1px solid var(--beige-dark);
+      margin: 28px 0;
+    }
+
+    .section-title {
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: var(--text-muted);
+      margin-bottom: 14px;
+      font-style: italic;
+    }
+
+    /* ── Footer ──────────────────────────────────────────────────────────────── */
+    footer {
+      background: var(--brown-dark);
+      color: var(--beige-mid);
+      text-align: center;
+      padding: 18px 24px;
+      font-size: 0.85rem;
+      letter-spacing: 0.03em;
+    }
+
+    footer span { color: var(--brown-light); font-weight: bold; }
+
+    /* ── Responsive ──────────────────────────────────────────────────────────── */
+    @media (max-width: 560px) {
+      .card { padding: 28px 20px; }
+      header h1 { font-size: 1.5rem; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ── Header ──────────────────────────────────────────────────────────── -->
+  <header>
+    <h1>Intrastat Factuur Import</h1>
+    <p>Upload een aankoopfactuur (PDF) en ontvang een kant-en-klaar Intrastat Excel-bestand</p>
+  </header>
+
+  <!-- ── Main ────────────────────────────────────────────────────────────── -->
+  <main>
+    <div class="card">
+
+      <!-- Upload section -->
+      <div id="upload-section">
+        <p class="section-title">Stap 1 — Kies uw PDF-factuur</p>
+
+        <label class="upload-label" for="file-input">
+          <div class="drop-zone" id="drop-zone">
+            <!-- PDF icon -->
+            <svg width="56" height="56" viewBox="0 0 56 56" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <rect x="8" y="4" width="32" height="42" rx="3" fill="#c9a96e" opacity="0.25"/>
+              <rect x="10" y="6" width="28" height="38" rx="2" fill="#c9a96e" opacity="0.4"/>
+              <path d="M32 6v10h10" stroke="#8b7355" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              <rect x="8" y="4" width="32" height="42" rx="3" stroke="#8b7355" stroke-width="2" fill="none"/>
+              <text x="28" y="35" font-size="9" fill="#8b7355" text-anchor="middle" font-family="Georgia,serif" font-weight="bold">PDF</text>
+              <line x1="14" y1="22" x2="34" y2="22" stroke="#8b7355" stroke-width="1.5" opacity="0.5" stroke-linecap="round"/>
+              <line x1="14" y1="28" x2="30" y2="28" stroke="#8b7355" stroke-width="1.5" opacity="0.5" stroke-linecap="round"/>
+            </svg>
+            <p class="hint">Sleep uw PDF hier of klik om te bladeren</p>
+            <p class="sub-hint">Aankoopfacturen met artikelregels · max. 20 MB</p>
+          </div>
+        </label>
+
+        <input type="file" id="file-input" accept=".pdf" />
+
+        <!-- File pill -->
+        <div id="file-pill">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#8b7355" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14,2 14,8 20,8"/>
+          </svg>
+          <span id="file-name-text"></span>
+          <button id="remove-file" type="button" title="Verwijder bestand">✕</button>
+        </div>
+
+        <hr class="divider" />
+        <p class="section-title">Stap 2 — Verwerk de factuur</p>
+
+        <button id="submit-btn" disabled>Verwerk naar Intrastat Excel</button>
+
+        <div id="error-box"></div>
+      </div>
+
+      <!-- Progress section -->
+      <div id="progress-section">
+        <div class="spinner-wrap">
+          <div class="spinner"></div>
+          <p style="color: var(--brown-dark); font-size: 1rem;">Factuur wordt verwerkt…</p>
+          <div class="progress-bar-wrap" style="width: 100%">
+            <div class="progress-bar" id="progress-bar"></div>
+          </div>
+          <div class="progress-steps">
+            <div class="step" id="step-upload">
+              <div class="dot"></div><span>PDF uploaden</span>
+            </div>
+            <div class="step" id="step-parse">
+              <div class="dot"></div><span>Tabellen en tekst herkennen</span>
+            </div>
+            <div class="step" id="step-extract">
+              <div class="dot"></div><span>Artikelregels extraheren</span>
+            </div>
+            <div class="step" id="step-excel">
+              <div class="dot"></div><span>Intrastat Excel aanmaken</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Result section -->
+      <div id="result-section">
+        <div class="result-box">
+          <h2>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"/>
+              <polyline points="9,12 12,15 16,10"/>
+            </svg>
+            Verwerking geslaagd!
+          </h2>
+          <div class="result-meta" id="result-meta"></div>
+          <a id="download-btn" href="#" download>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7,10 12,15 17,10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            Download Intrastat Excel
+          </a>
+          <button id="new-upload-btn">↩ Nieuwe factuur uploaden</button>
+        </div>
+      </div>
+
+    </div>
+  </main>
+
+  <!-- ── Footer ──────────────────────────────────────────────────────────── -->
+  <footer>
+    Ontwikkeld door <span>Lander Smits</span> &nbsp;·&nbsp; Intrastat Factuur Import App &nbsp;·&nbsp; &copy; <span id="year"></span>
+  </footer>
+
+  <script>
+    // ── State ──────────────────────────────────────────────────────────────
+    let selectedFile = null;
+
+    // ── DOM refs ───────────────────────────────────────────────────────────
+    const fileInput      = document.getElementById('file-input');
+    const dropZone       = document.getElementById('drop-zone');
+    const filePill       = document.getElementById('file-pill');
+    const fileNameText   = document.getElementById('file-name-text');
+    const removeFileBtn  = document.getElementById('remove-file');
+    const submitBtn      = document.getElementById('submit-btn');
+    const uploadSection  = document.getElementById('upload-section');
+    const progressSection= document.getElementById('progress-section');
+    const resultSection  = document.getElementById('result-section');
+    const errorBox       = document.getElementById('error-box');
+    const progressBar    = document.getElementById('progress-bar');
+    const downloadBtn    = document.getElementById('download-btn');
+    const newUploadBtn   = document.getElementById('new-upload-btn');
+    const resultMeta     = document.getElementById('result-meta');
+
+    // Year in footer
+    document.getElementById('year').textContent = new Date().getFullYear();
+
+    // ── File selection ─────────────────────────────────────────────────────
+    function setFile(file) {
+      if (!file || file.type !== 'application/pdf') {
+        showError('Selecteer een geldig PDF-bestand.');
+        return;
+      }
+      if (file.size > 20 * 1024 * 1024) {
+        showError('Het bestand is groter dan 20 MB.');
+        return;
+      }
+      selectedFile = file;
+      fileNameText.textContent = file.name;
+      filePill.style.display = 'flex';
+      submitBtn.disabled = false;
+      hideError();
+    }
+
+    function clearFile() {
+      selectedFile = null;
+      fileInput.value = '';
+      filePill.style.display = 'none';
+      submitBtn.disabled = true;
+    }
+
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files[0]) setFile(fileInput.files[0]);
+    });
+
+    removeFileBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      clearFile();
+    });
+
+    // ── Drag & drop ────────────────────────────────────────────────────────
+    ['dragenter', 'dragover'].forEach(evt => {
+      dropZone.addEventListener(evt, (e) => {
+        e.preventDefault();
+        dropZone.classList.add('drag-over');
+      });
+    });
+
+    ['dragleave', 'drop'].forEach(evt => {
+      dropZone.addEventListener(evt, (e) => {
+        e.preventDefault();
+        dropZone.classList.remove('drag-over');
+      });
+    });
+
+    dropZone.addEventListener('drop', (e) => {
+      const file = e.dataTransfer.files[0];
+      if (file) setFile(file);
+    });
+
+    // ── Progress animation ─────────────────────────────────────────────────
+    const steps = ['step-upload', 'step-parse', 'step-extract', 'step-excel'];
+
+    function animateProgress() {
+      const durations = [400, 800, 700, 600];   // ms per step
+      const widths    = [20, 45, 72, 92];
+      let idx = 0;
+
+      function nextStep() {
+        if (idx > 0) {
+          document.getElementById(steps[idx - 1]).className = 'step done';
+        }
+        if (idx < steps.length) {
+          document.getElementById(steps[idx]).className = 'step active';
+          progressBar.style.width = widths[idx] + '%';
+          idx++;
+          setTimeout(nextStep, durations[idx - 1] || 600);
+        }
+      }
+
+      nextStep();
+    }
+
+    function finishProgress() {
+      steps.forEach(s => document.getElementById(s).className = 'step done');
+      progressBar.style.width = '100%';
+    }
+
+    // ── Error helpers ──────────────────────────────────────────────────────
+    function showError(msg) {
+      errorBox.textContent = msg;
+      errorBox.style.display = 'block';
+    }
+
+    function hideError() {
+      errorBox.style.display = 'none';
+    }
+
+    // ── Meta display ───────────────────────────────────────────────────────
+    function renderMeta(data) {
+      const items = [
+        { label: 'Artikelregels',  value: data.item_count },
+        { label: 'Leverancier',    value: data.meta?.leverancier || '—' },
+        { label: 'Factuurnummer',  value: data.meta?.factuurnummer || '—' },
+        { label: 'Datum factuur',  value: data.meta?.datum || '—' },
+      ];
+      resultMeta.innerHTML = items.map(i => `
+        <div class="meta-item">
+          <div class="label">${i.label}</div>
+          <div class="value">${i.value}</div>
+        </div>
+      `).join('');
+    }
+
+    // ── Submit ─────────────────────────────────────────────────────────────
+    submitBtn.addEventListener('click', async () => {
+      if (!selectedFile) return;
+
+      hideError();
+      uploadSection.style.display  = 'none';
+      resultSection.style.display  = 'none';
+      progressSection.style.display = 'block';
+
+      // Reset step classes
+      steps.forEach(s => {
+        document.getElementById(s).className = 'step';
+      });
+      progressBar.style.width = '0%';
+
+      animateProgress();
+
+      const formData = new FormData();
+      formData.append('pdf', selectedFile);
+
+      let data;
+      try {
+        const resp = await fetch('/upload', { method: 'POST', body: formData });
+        data = await resp.json();
+
+        if (!resp.ok) {
+          throw new Error(data.error || `HTTP ${resp.status}`);
+        }
+      } catch (err) {
+        progressSection.style.display = 'none';
+        uploadSection.style.display   = 'block';
+        showError(err.message || 'Er is een onbekende fout opgetreden.');
+        return;
+      }
+
+      finishProgress();
+
+      // Short pause so user sees 100% bar
+      await new Promise(r => setTimeout(r, 500));
+
+      progressSection.style.display = 'none';
+      resultSection.style.display   = 'block';
+
+      renderMeta(data);
+      downloadBtn.href = `/download/${data.token}`;
+      downloadBtn.download = data.filename;
+    });
+
+    // ── New upload ─────────────────────────────────────────────────────────
+    newUploadBtn.addEventListener('click', () => {
+      resultSection.style.display  = 'none';
+      uploadSection.style.display  = 'block';
+      clearFile();
+    });
+  </script>
+</body>
+</html>
