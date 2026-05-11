@@ -2,10 +2,14 @@
 Intrastat PDF Extractor  —  NBB/Intrastat Excel + CSV generator
 Auteur: Lander Smits
 
+Beveiliging:
+  Stel APP_PASSWORD in als omgevingsvariabele (Render → Environment).
+  Zonder APP_PASSWORD is de app vrij toegankelijk (lokaal ontwikkelen).
+
 Kolommen (identiek aan NBB-template):
   A  Goederencode        — CN-code 8 cijfers
   B  Gewest              — vast: "1 Vlaams gewest"
-  C  Land                — vast: "Italie" (configureerbaar)
+  C  Land                — vast: "Italie"
   D  Aard transactie     — vast
   E  Incoterm            — vast: "EXW Af fabriek"
   F  Vervoerswijze       — vast: "3 Wegvervoer"
@@ -19,26 +23,88 @@ import csv
 import io
 import os
 import re
+import time
 import uuid
+import secrets
 import logging
+import threading
 from collections import Counter, OrderedDict
 from datetime import datetime
+from functools import wraps
 
 import pdfplumber
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from flask import Flask, request, jsonify, send_file, render_template, abort
+from flask import (Flask, request, jsonify, send_file, render_template,
+                   abort, session, redirect, url_for)
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
+app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# token -> {excel, csv, ts}
 RESULT_STORE = {}
+STORE_LOCK   = threading.Lock()
+
+# Wachtwoord (leeg = geen beveiliging)
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 
 # ---------------------------------------------------------------------------
-# Vaste NBB/Intrastat waarden  (aanpasbaar per leverancier)
+# Automatische opruiming: resultaten ouder dan 10 minuten worden verwijderd
+# ---------------------------------------------------------------------------
+
+def _cleanup_loop():
+    while True:
+        time.sleep(300)
+        cutoff = time.time() - 600
+        with STORE_LOCK:
+            old = [k for k, v in RESULT_STORE.items() if v.get("ts", 0) < cutoff]
+            for k in old:
+                del RESULT_STORE[k]
+        if old:
+            logger.info("Opgeruimd: %d verlopen resultaten", len(old))
+
+threading.Thread(target=_cleanup_loop, daemon=True).start()
+
+# ---------------------------------------------------------------------------
+# Wachtwoordbeveiliging
+# ---------------------------------------------------------------------------
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if APP_PASSWORD and not session.get("authenticated"):
+            return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return decorated
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not APP_PASSWORD:
+        return redirect(url_for("index"))
+    error = None
+    if request.method == "POST":
+        pw = request.form.get("password", "")
+        if secrets.compare_digest(pw, APP_PASSWORD):
+            session["authenticated"] = True
+            return redirect(url_for("index"))
+        error = "Ongeldig wachtwoord"
+    return render_template("login.html", error=error)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+# ---------------------------------------------------------------------------
+# Vaste NBB/Intrastat waarden
 # ---------------------------------------------------------------------------
 FIXED_GEWEST   = "1 Vlaams gewest"
 FIXED_LAND     = "Italie"
@@ -46,8 +112,6 @@ FIXED_AARD     = ("Rechtstreekse verkoop/aankoop, behalve rechtstreekse handel "
                   "met/door particuliere consumenten")
 FIXED_INCOTERM = "EXW Af fabriek"
 FIXED_VERVOER  = "3 Wegvervoer"
-
-# CN-prefixen zonder aanvullende eenheid (accessoires/harnas/leer)
 NO_SUPPL_PREFIXES = ("42",)
 
 # ---------------------------------------------------------------------------
@@ -91,17 +155,11 @@ def clean_num(val):
 def has_suppl_unit(cn8):
     return not cn8.startswith(NO_SUPPL_PREFIXES)
 
-
 # ---------------------------------------------------------------------------
 # PDF parser
 # ---------------------------------------------------------------------------
 
 def parse_pdf(pdf_bytes):
-    """
-    Leest alle productlijnen uit de PDF.
-    Gebruikt de VALUE-kolom als financieel bedrag (niet price x qty).
-    Retourneert (lines, full_text, meta).
-    """
     lines = []
     full_text = ""
 
@@ -115,7 +173,6 @@ def parse_pdf(pdf_bytes):
                     continue
                 raw = [[str(c).strip() if c else "" for c in r] for r in table]
 
-                # Detecteer headerrij
                 hkw = re.compile(r"(quantity|price|discount|value)", re.I)
                 hidx = 0
                 for i, row in enumerate(raw[:5]):
@@ -124,7 +181,6 @@ def parse_pdf(pdf_bytes):
                         break
                 hdrs = [h.lower() for h in raw[hidx]]
 
-                # Alleen tabellen met VALUE-kolom (geen summary-tabellen)
                 has_val = any(
                     "value" in h and "taxable" not in h and "free" not in h
                     for h in hdrs
@@ -154,41 +210,31 @@ def parse_pdf(pdf_bytes):
                     def get(idx):
                         return row[idx] if idx is not None and idx < len(row) else ""
 
-                    # CN-code: 8 cijfers
                     m = CN8_RE.search(get(i_cn))
                     if not m:
                         continue
                     cn8 = m.group(1)
 
-                    # Sla samenvattingsrijen over
                     if SKIP_RE.search(" ".join(row)):
                         continue
 
-                    # VALUE = netto lijnbedrag na korting
                     value = clean_num(get(i_val))
                     if value is None or value <= 0:
                         continue
 
-                    # Hoeveelheid
                     qty_raw = clean_num(get(i_qty))
                     qty = int(qty_raw) if qty_raw is not None else 0
 
-                    # Gewicht: "Weight gr NNN" → NNN/1000 kg (lijngewicht)
                     art_cell = get(0)
                     wm = WEIGHT_RE.search(art_cell)
                     weight_kg = round(int(wm.group(1)) / 1000, 4) if wm else None
 
-                    # Oorsprongsland
                     mm = MADE_IN_RE.search(art_cell)
                     made_in = mm.group(1).upper() if mm else ""
 
                     lines.append({
-                        "pn":        pn,
-                        "cn8":       cn8,
-                        "qty":       qty,
-                        "value":     value,
-                        "weight_kg": weight_kg,
-                        "made_in":   made_in,
+                        "pn": pn, "cn8": cn8, "qty": qty,
+                        "value": value, "weight_kg": weight_kg, "made_in": made_in,
                     })
 
     meta = _extract_meta(full_text)
@@ -225,10 +271,6 @@ def _extract_meta(text):
 
 
 def _extract_invoice_total(text):
-    """
-    Zoek het eindtotaal van de factuur in de PDF-tekst.
-    Probeert meerdere patronen; retourneert het meest voorkomende grote bedrag.
-    """
     patterns = [
         r"Non\s+imp\.?\s+Art\s+\d+\s+\S+\s+\S+\s+([\d.,]+)",
         r"EUR\s+([\d]{2,3}[.,]\d{3}[.,]\d{2})",
@@ -247,38 +289,23 @@ def _extract_invoice_total(text):
 
 
 def aggregate_by_cn8(lines):
-    """
-    Groepeert alle PDF-lijnen per CN-code.
-    qty, waarde en gewicht worden opgeteld.
-    Elke goederencode verschijnt exact een keer. Volgorde = eerste verschijning.
-    """
     groups = OrderedDict()
     for line in lines:
         cn8 = line["cn8"]
         if cn8 not in groups:
-            groups[cn8] = {
-                "cn8":       cn8,
-                "qty":       0,
-                "value":     0.0,
-                "weight_kg": 0.0,
-            }
+            groups[cn8] = {"cn8": cn8, "qty": 0, "value": 0.0, "weight_kg": 0.0}
         groups[cn8]["qty"]      += line["qty"]
         groups[cn8]["value"]     = round(groups[cn8]["value"] + line["value"], 2)
         groups[cn8]["weight_kg"] = round(
-            groups[cn8]["weight_kg"] + (line["weight_kg"] or 0), 4
-        )
+            groups[cn8]["weight_kg"] + (line["weight_kg"] or 0), 4)
     return list(groups.values())
-
 
 # ---------------------------------------------------------------------------
 # NBB-rij bouwen
 # ---------------------------------------------------------------------------
 
 def build_nbb_row(agg):
-    cn8       = agg["cn8"]
-    qty       = agg["qty"]
-    value     = agg["value"]
-    weight_kg = agg["weight_kg"]
+    cn8 = agg["cn8"]
     return {
         "goederencode":  cn8,
         "gewest":        FIXED_GEWEST,
@@ -286,13 +313,12 @@ def build_nbb_row(agg):
         "aard":          FIXED_AARD,
         "incoterm":      FIXED_INCOTERM,
         "vervoer":       FIXED_VERVOER,
-        "netto_gewicht": weight_kg if weight_kg else 0,
-        "waarde":        value,
-        "waarde_eur":    value,
-        "aanv_eenheden": qty if has_suppl_unit(cn8) else 0,
+        "netto_gewicht": agg["weight_kg"] if agg["weight_kg"] else 0,
+        "waarde":        agg["value"],
+        "waarde_eur":    agg["value"],
+        "aanv_eenheden": agg["qty"] if has_suppl_unit(cn8) else 0,
         "aanv_eenh":     "p/st" if has_suppl_unit(cn8) else None,
     }
-
 
 # ---------------------------------------------------------------------------
 # Excel builder
@@ -316,11 +342,10 @@ def _side(color="D4C5A9"):
     return Border(left=s, right=s, top=s, bottom=s)
 
 
-def build_excel(nbb_rows, meta, check_msg=""):
+def build_excel(nbb_rows, meta):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Intrastat"
-
     ncols = len(HEADERS)
 
     # Titelrij
@@ -331,43 +356,44 @@ def build_excel(nbb_rows, meta, check_msg=""):
     t.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 26
 
-    # Metarij
+    # Metarij links
+    factuurnr = meta.get("factuurnummer", "")
+    datum     = meta.get("datum", "")
+    leveranc  = meta.get("leverancier", "")
+    parts = []
+    if leveranc:  parts.append("Leverancier: " + leveranc)
+    if factuurnr: parts.append("Factuurnr: " + factuurnr)
+    if datum:     parts.append("Datum: " + datum)
+
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=6)
-    ws.cell(row=2, column=1,
-            value=("Leverancier: " + meta.get("leverancier", "") +
-                   "   Factuurnr: " + meta.get("factuurnummer", "") +
-                   "   Datum: " + meta.get("datum", "")))
+    ws.cell(row=2, column=1, value="   ".join(parts))
     ws.cell(row=2, column=1).font      = Font(italic=True, size=9, color="5C4A32")
     ws.cell(row=2, column=1).fill      = PatternFill("solid", fgColor="EDE5D0")
-    ws.cell(row=2, column=1).alignment = Alignment(horizontal="left", indent=1,
-                                                    vertical="center")
+    ws.cell(row=2, column=1).alignment = Alignment(horizontal="left", indent=1, vertical="center")
 
+    # Metarij rechts
     ws.merge_cells(start_row=2, start_column=7, end_row=2, end_column=ncols)
-    ws.cell(row=2, column=7,
-            value=("Export: " + datetime.today().strftime("%d/%m/%Y %H:%M") +
-                   "   " + check_msg))
+    ws.cell(row=2, column=7, value="Export: " + datetime.today().strftime("%d/%m/%Y %H:%M"))
     ws.cell(row=2, column=7).font      = Font(italic=True, size=9, color="5C4A32")
     ws.cell(row=2, column=7).fill      = PatternFill("solid", fgColor="EDE5D0")
-    ws.cell(row=2, column=7).alignment = Alignment(horizontal="right", indent=1,
-                                                    vertical="center")
+    ws.cell(row=2, column=7).alignment = Alignment(horizontal="right", indent=1, vertical="center")
     ws.row_dimensions[2].height = 14
 
     ws.append([])  # lege rij 3
 
-    # Kolomhoofden (rij 4)
+    # Kolomhoofden rij 4
     HR = 4
     for ci, (label, width) in enumerate(zip(HEADERS, COL_WIDTHS), 1):
         c = ws.cell(row=HR, column=ci, value=label)
         c.font      = Font(bold=True, color="FFFFFF", size=10)
         c.fill      = PatternFill("solid", fgColor=BROWN)
-        c.alignment = Alignment(horizontal="center", vertical="center",
-                                wrap_text=(ci == 4))
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=(ci == 4))
         c.border    = _side("FFFFFF")
         ws.column_dimensions[get_column_letter(ci)].width = width
     ws.row_dimensions[HR].height = 24
 
     # Datarijen
-    DS      = HR + 1
+    DS = HR + 1
     fmt_kg  = "#,##0.000"
     fmt_eur = "#,##0.00"
     fmt_qty = "#,##0"
@@ -376,7 +402,6 @@ def build_excel(nbb_rows, meta, check_msg=""):
         r    = DS + ri
         fill = PatternFill("solid", fgColor=BEIGE_ALT if ri % 2 == 0 else BEIGE_WHT)
         brd  = _side()
-
         vals = [
             row["goederencode"], row["gewest"], row["land"], row["aard"],
             row["incoterm"], row["vervoer"],
@@ -392,49 +417,40 @@ def build_excel(nbb_rows, meta, check_msg=""):
                 horizontal="right" if ci in (7, 8, 9, 10) else "left",
                 wrap_text=(ci == 4),
             )
-            if ci == 7 and isinstance(v, (int, float)):
-                c.number_format = fmt_kg
-            if ci in (8, 9) and isinstance(v, (int, float)):
-                c.number_format = fmt_eur
-            if ci == 10 and isinstance(v, (int, float)):
-                c.number_format = fmt_qty
+            if ci == 7 and isinstance(v, (int, float)):   c.number_format = fmt_kg
+            if ci in (8, 9) and isinstance(v, (int, float)): c.number_format = fmt_eur
+            if ci == 10 and isinstance(v, (int, float)):  c.number_format = fmt_qty
         ws.row_dimensions[r].height = 15
 
     # Totaalrij
     TR  = DS + len(nbb_rows)
     tf  = PatternFill("solid", fgColor=GOLD)
     tft = Font(bold=True, size=10)
-
     for ci in range(1, ncols + 1):
         c = ws.cell(row=TR, column=ci)
         c.fill = tf; c.border = _side(); c.font = tft
         c.alignment = Alignment(horizontal="center", vertical="center")
-
     ws.cell(row=TR, column=1, value="TOTAAL").font = tft
     ws.cell(row=TR, column=1).fill = tf
-
     for ci, fmt in [(7, fmt_kg), (8, fmt_eur), (9, fmt_eur), (10, fmt_qty)]:
-        col_letter = get_column_letter(ci)
+        col = get_column_letter(ci)
         cell = ws.cell(row=TR, column=ci)
-        cell.value = "=SUM(" + col_letter + str(DS) + ":" + col_letter + str(TR - 1) + ")"
+        cell.value = "=SUM(" + col + str(DS) + ":" + col + str(TR - 1) + ")"
         cell.number_format = fmt
         cell.font = tft; cell.fill = tf
         cell.alignment = Alignment(horizontal="right", vertical="center")
-
     ws.row_dimensions[TR].height = 20
 
     ws.freeze_panes = ws.cell(row=DS, column=1)
     ws.auto_filter.ref = (get_column_letter(1) + str(HR) + ":" +
                           get_column_letter(ncols) + str(TR - 1))
-
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
     return buf.read()
 
-
 # ---------------------------------------------------------------------------
-# CSV builder  (UTF-8 BOM, puntkomma  —  NBB-import)
+# CSV builder
 # ---------------------------------------------------------------------------
 
 def build_csv(nbb_rows):
@@ -445,31 +461,36 @@ def build_csv(nbb_rows):
         wt  = str(row["netto_gewicht"]).replace(".", ",") if row["netto_gewicht"] else ""
         val = str(row["waarde"]).replace(".", ",")
         writer.writerow([
-            row["goederencode"],
-            row["gewest"],
-            row["land"],
-            row["aard"],
-            row["incoterm"],
-            row["vervoer"],
-            wt,
-            val,
-            val,
-            str(row["aanv_eenheden"]),
-            row["aanv_eenh"] or "",
+            row["goederencode"], row["gewest"], row["land"], row["aard"],
+            row["incoterm"], row["vervoer"], wt, val, val,
+            str(row["aanv_eenheden"]), row["aanv_eenh"] or "",
         ])
     return buf.getvalue().encode("utf-8-sig")
 
+# ---------------------------------------------------------------------------
+# Bestandsnaam
+# ---------------------------------------------------------------------------
+
+def _make_base_name(meta, pdf_filename):
+    factuurnr = meta.get("factuurnummer", "").strip()
+    if factuurnr:
+        safe_nr = re.sub(r"[^A-Za-z0-9_\-]", "", factuurnr)
+        if safe_nr:
+            return safe_nr
+    return secure_filename(pdf_filename).rsplit(".", 1)[0] or "intrastat"
 
 # ---------------------------------------------------------------------------
 # Flask routes
 # ---------------------------------------------------------------------------
 
 @app.route("/")
+@login_required
 def index():
     return render_template("index.html")
 
 
 @app.route("/upload", methods=["POST"])
+@login_required
 def upload():
     if "pdf" not in request.files:
         return jsonify({"error": "Geen bestand ontvangen."}), 400
@@ -489,88 +510,82 @@ def upload():
         return jsonify({"error": "Fout bij verwerken: " + str(exc)}), 500
 
     if not lines:
-        return jsonify({
-            "error": (
-                "Geen productlijnen gevonden. "
-                "Controleer of de PDF leesbare tekst bevat met een "
-                "QUANTITY / VALUE / CUSTOMS-tabelstructuur."
-            )
-        }), 422
+        return jsonify({"error": (
+            "Geen productlijnen gevonden. "
+            "Controleer of de PDF leesbare tekst bevat met een "
+            "QUANTITY / VALUE / CUSTOMS-tabelstructuur."
+        )}), 422
 
-    # Stap 1: aggregeer per CN-code
     aggregated = aggregate_by_cn8(lines)
     nbb_rows   = [build_nbb_row(a) for a in aggregated]
     total_eur  = round(sum(r["waarde"] for r in nbb_rows), 2)
 
-    # Stap 2: dubbelcheck met factuurtotaal uit PDF
     pdf_total = _extract_invoice_total(full_text)
-
     if pdf_total is not None:
-        diff      = round(abs(total_eur - pdf_total), 2)
-        check_ok  = diff < 0.02
-        if check_ok:
-            check_msg = "Totaal klopt: EUR {:,.2f} = PDF-factuurtotaal".format(total_eur)
-        else:
-            check_msg = ("Verschil: berekend EUR {:,.2f} vs "
-                         "PDF-totaal EUR {:,.2f} (diff {:,.2f})").format(
+        diff     = round(abs(total_eur - pdf_total), 2)
+        check_ok = diff < 0.02
+        check_msg = (
+            "Totaal klopt: EUR {:,.2f} = PDF-factuurtotaal".format(total_eur)
+            if check_ok else
+            "Verschil: berekend EUR {:,.2f} vs PDF-totaal EUR {:,.2f} (diff {:,.2f})".format(
                 total_eur, pdf_total, diff)
-        logger.info("Dubbelcheck: %s", check_msg)
+        )
     else:
         check_ok  = True
         check_msg = "PDF-factuurtotaal niet gevonden (handmatige controle)"
         pdf_total = None
 
-    safe      = secure_filename(file.filename).replace(".pdf", "")
+    base      = _make_base_name(meta, file.filename)
     date_str  = datetime.today().strftime("%Y%m%d")
-    xlsx_name = "intrastat_" + safe + "_" + date_str + ".xlsx"
-    csv_name  = "intrastat_" + safe + "_" + date_str + ".csv"
+    xlsx_name = "intrastat_" + base + "_" + date_str + ".xlsx"
+    csv_name  = "intrastat_" + base + "_" + date_str + ".csv"
 
     try:
-        excel_bytes = build_excel(nbb_rows, meta, check_msg)
+        excel_bytes = build_excel(nbb_rows, meta)
         csv_bytes   = build_csv(nbb_rows)
     except Exception as exc:
         logger.exception("Bestand aanmaken mislukt")
         return jsonify({"error": "Bestand aanmaken mislukt: " + str(exc)}), 500
 
     token = str(uuid.uuid4())
-    RESULT_STORE[token] = {
-        "excel": (excel_bytes, xlsx_name),
-        "csv":   (csv_bytes,   csv_name),
-    }
+    with STORE_LOCK:
+        RESULT_STORE[token] = {
+            "excel": (excel_bytes, xlsx_name),
+            "csv":   (csv_bytes,   csv_name),
+            "ts":    time.time(),
+        }
 
     return jsonify({
-        "token":      token,
-        "xlsx_name":  xlsx_name,
-        "csv_name":   csv_name,
-        "item_count": len(nbb_rows),
-        "raw_lines":  len(lines),
-        "total_eur":  total_eur,
-        "pdf_total":  pdf_total,
-        "check_ok":   check_ok,
-        "check_msg":  check_msg,
-        "meta":       meta,
+        "token": token, "xlsx_name": xlsx_name, "csv_name": csv_name,
+        "item_count": len(nbb_rows), "raw_lines": len(lines),
+        "total_eur": total_eur, "pdf_total": pdf_total,
+        "check_ok": check_ok, "check_msg": check_msg, "meta": meta,
     })
 
 
 @app.route("/download/<token>/<fmt>")
+@login_required
 def download(token, fmt):
-    result = RESULT_STORE.get(token)
+    with STORE_LOCK:
+        result = RESULT_STORE.get(token)
     if result is None:
         abort(404)
     if fmt not in ("excel", "csv"):
         abort(400)
     data, filename = result[fmt]
-    if fmt == "excel":
-        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    else:
-        mime = "text/csv; charset=utf-8"
+    mime = (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        if fmt == "excel" else "text/csv; charset=utf-8"
+    )
     return send_file(io.BytesIO(data), mimetype=mime,
                      as_attachment=True, download_name=filename)
 
 
 @app.route("/done/<token>")
+@login_required
 def done(token):
-    RESULT_STORE.pop(token, None)
+    with STORE_LOCK:
+        RESULT_STORE.pop(token, None)
     return "", 204
 
 
