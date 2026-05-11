@@ -1,103 +1,154 @@
 # Intrastat PDF Extractor
 
-Een Flask webapplicatie die aankoopfacturen (PDF) omzet naar NBB Intrastat-bestanden (Excel + CSV).  
+**Wat doet dit?**
+Je uploadt een aankoopfactuur als PDF. De app leest automatisch alle artikellijnen, groepeert ze per goederencode (CN-code) en genereert een kant-en-klaar Excel-bestand in het NBB Intrastat-formaat, plus een CSV voor rechtstreekse import. De app controleert ook of de berekende totalen overeenkomen met het factuurtotaal.
+
 Gemaakt door **Lander Smits**.
 
 ---
 
-## Wat doet het?
+## Wat heb je nodig?
 
-- Upload een PDF-factuur (met QUANTITY / VALUE / CUSTOMS-kolommen)
-- De app haalt alle productlijnen op, groepeert ze per CN/goederencode en telt bedragen, gewichten en hoeveelheden op
-- Output: een kant-en-klaar `.xlsx` bestand in NBB Intrastat-formaat + een `.csv` voor directe import
-- Automatische dubbelcheck: som van lijnen vs. factuurtotaal uit de PDF
+- Een computer met **Windows, Mac of Linux**
+- **Python 3.10 of nieuwer** — gratis te downloaden op [python.org](https://www.python.org/downloads/)
+- Een internetverbinding (alleen voor de installatie)
 
 ---
 
-## Gratis hosten op Render
+## Stap 1 — Installeer Python
 
-### Eenmalige setup (5 minuten)
+> Sla deze stap over als Python al geïnstalleerd is.
 
-1. **Maak een gratis account aan op [render.com](https://render.com)**
+1. Ga naar [python.org/downloads](https://www.python.org/downloads/)
+2. Klik op de grote gele knop **"Download Python 3.x.x"**
+3. Open het gedownloade bestand en volg de installatie
+   - ⚠️ **Belangrijk voor Windows:** vink onderaan het installatiescherm **"Add Python to PATH"** aan vóór je op Install klikt
 
-2. **Klik op "New +" → "Web Service"**
+Om te controleren of Python correct geïnstalleerd is, open je een terminal en typ:
+```
+python --version
+```
+Je zou iets moeten zien als `Python 3.12.0`.
 
-3. **Verbind je GitHub-repo:**  
-   Kies `lander-sm07/factuur-app` (of geef Render toegang tot je GitHub-account)
+---
 
-4. **Instellingen** (Render detecteert dit automatisch via `render.yaml`):
-   | Veld | Waarde |
-   |------|--------|
-   | Name | `intrastat-pdf-extractor` |
-   | Runtime | `Python 3` |
-   | Build Command | `pip install -r requirements.txt` |
-   | Start Command | `gunicorn app:app` |
-   | Plan | **Free** |
+## Stap 2 — Download de app
 
-5. **Klik "Create Web Service"** — Render bouwt en deployt automatisch
-
-6. Na ~2 minuten krijg je een URL zoals:  
-   `https://intrastat-pdf-extractor.onrender.com`
-
-### Updates deployen
-
-Elke keer dat je naar GitHub pusht wordt de app automatisch hergebouwd:
-
-```bash
-git add -A
-git commit -m "update"
-git push
+### Optie A — Via Git (aanbevolen)
+Open een terminal en typ:
+```
+git clone https://github.com/lander-sm07/factuur-app.git
+cd factuur-app
 ```
 
-### Let op bij de gratis tier
-
-- De app **gaat slapen** na 15 minuten zonder gebruik — de eerste request duurt dan ~30 seconden
-- Voor actief gebruik is de gratis tier prima; voor productie upgrade je naar de "Starter" tier ($7/maand)
+### Optie B — Zonder Git
+1. Ga naar [github.com/lander-sm07/factuur-app](https://github.com/lander-sm07/factuur-app)
+2. Klik op de groene knop **"Code"** → **"Download ZIP"**
+3. Pak het ZIP-bestand uit
+4. Open een terminal en navigeer naar de uitgepakte map:
+   ```
+   cd pad/naar/factuur-app
+   ```
 
 ---
 
-## Lokaal draaien
+## Stap 3 — Installeer de benodigde pakketten
 
-```bash
-# Installeer dependencies
+Typ dit in de terminal (éénmalig):
+
+**Windows:**
+```
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
+```
 
-# Start de app
+**Mac / Linux:**
+```
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Je ziet een hoop tekst voorbijkomen terwijl de pakketten installeren. Dat is normaal. Wacht tot het klaar is.
+
+---
+
+## Stap 4 — Start de app
+
+**Windows:**
+```
+.venv\Scripts\activate
 python app.py
-# of via gunicorn:
-gunicorn app:app
+```
 
-# Open in browser
-# http://localhost:5000
+**Mac / Linux:**
+```
+source .venv/bin/activate
+python3 app.py
+```
+
+Je ziet iets als:
+```
+ * Running on http://127.0.0.1:5000
 ```
 
 ---
 
-## Technische stack
+## Stap 5 — Gebruik de app
 
-| Component | Bibliotheek |
-|-----------|------------|
-| Webframework | Flask 3.0 |
-| PDF-extractie | pdfplumber |
-| Excel-output | openpyxl |
-| Productieserver | gunicorn |
+1. Open je browser (Chrome, Edge, Firefox, ...)
+2. Ga naar **[http://localhost:5000](http://localhost:5000)**
+3. Sleep je PDF-factuur naar het uploadvenster of klik om te bladeren
+4. Klik op **"Generate Intrastat Excel"**
+5. Download het Excel-bestand (.xlsx) of het CSV-bestand voor NBB-import
 
 ---
 
-## Configuratie
+## De app stoppen
 
-Vaste NBB-waarden staan bovenaan `app.py` en zijn eenvoudig aan te passen:
+Klik in de terminal op **Ctrl + C**.
 
-```python
-FIXED_GEWEST   = "1 Vlaams gewest"
-FIXED_LAND     = "Italie"
-FIXED_AARD     = "Rechtstreekse verkoop/aankoop..."
-FIXED_INCOTERM = "EXW Af fabriek"
-FIXED_VERVOER  = "3 Wegvervoer"
+---
+
+## De volgende keer opstarten
+
+Je hoeft stap 1–3 maar één keer te doen. Daarna is het gewoon:
+
+**Windows:**
+```
+cd factuur-app
+.venv\Scripts\activate
+python app.py
+```
+
+**Mac / Linux:**
+```
+cd factuur-app
+source .venv/bin/activate
+python3 app.py
 ```
 
 ---
 
-## Licentie
+## Problemen?
 
-Privéproject — © Lander Smits
+| Fout | Oplossing |
+|------|-----------|
+| `python` werkt niet | Probeer `python3` in plaats van `python` |
+| `pip` werkt niet | Probeer `pip3` in plaats van `pip` |
+| Poort 5000 bezet | Wijzig de poort: `python app.py` → de app kijkt naar de `PORT` omgevingsvariabele, of open `app.py` en verander `5000` naar `5001` |
+| Pagina laadt niet | Controleer of de terminal nog actief is en geen foutmelding toont |
+
+---
+
+## Technische details (voor wie het wil weten)
+
+| Onderdeel | Wat |
+|-----------|-----|
+| Webframework | Flask |
+| PDF-uitlezen | pdfplumber |
+| Excel aanmaken | openpyxl |
+| Taal | Python 3 |
+
+De vaste NBB-waarden (gewest, land, incoterm, ...) staan bovenaan `app.py` en zijn eenvoudig aan te passen.
