@@ -1,6 +1,10 @@
 """
 Intrastat PDF Extractor  —  NBB/Intrastat Excel + CSV generator
 Auteur: Lander Smits
+
+PDF-bibliotheek: PyMuPDF (fitz) als beschikbaar, anders pdfplumber.
+- PyMuPDF: C-bibliotheek, ~5x minder geheugen  → gebruikt op Render
+- pdfplumber: pure Python                        → gebruikt lokaal als fallback
 """
 import csv
 import gc
@@ -16,7 +20,14 @@ from collections import Counter, OrderedDict
 from datetime import datetime
 from functools import wraps
 
-import pdfplumber
+# Detecteer beschikbare PDF-bibliotheek
+try:
+    import fitz  # PyMuPDF
+    USE_PYMUPDF = True
+except ImportError:
+    import pdfplumber
+    USE_PYMUPDF = False
+
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -30,13 +41,14 @@ app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logger.info("PDF-bibliotheek: %s", "PyMuPDF" if USE_PYMUPDF else "pdfplumber")
 
 RESULT_STORE = {}
 STORE_LOCK   = threading.Lock()
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 
 # ---------------------------------------------------------------------------
-# Auto-opruiming: resultaten ouder dan 10 min
+# Auto-opruiming resultaten > 10 min
 # ---------------------------------------------------------------------------
 
 def _cleanup_loop():
@@ -171,11 +183,121 @@ def _update_meta(meta, text):
                 meta["leverancier"] = m.group(1).strip()
                 break
 
+
+def _process_raw_table(raw_table, lines, pn):
+    """Gemeenschappelijke tabelverwerking voor zowel PyMuPDF als pdfplumber."""
+    if not raw_table or len(raw_table) < 2:
+        return
+
+    hkw  = re.compile(r"(quantity|price|discount|value)", re.I)
+    hidx = 0
+    for i, row in enumerate(raw_table[:5]):
+        if sum(1 for c in (row or []) if c and hkw.search(str(c))) >= 3:
+            hidx = i
+            break
+
+    hdrs = [str(c).lower().strip() if c else "" for c in raw_table[hidx]]
+
+    has_val = any(
+        "value" in h and "taxable" not in h and "free" not in h
+        for h in hdrs
+    )
+    if not has_val:
+        return
+
+    def find_col(patterns, exclude=None):
+        for i, h in enumerate(hdrs):
+            if exclude and any(e in h for e in exclude):
+                continue
+            if any(p in h for p in patterns):
+                return i
+        return None
+
+    i_cn  = find_col(["customs"])
+    i_qty = find_col(["quantity"])
+    i_val = find_col(["value"], exclude=["taxable", "free"])
+
+    if i_val is None:
+        return
+
+    for row in raw_table[hidx + 1:]:
+        if not row or not any(row):
+            continue
+
+        def get(idx):
+            if idx is None or idx >= len(row):
+                return ""
+            return str(row[idx]).strip() if row[idx] is not None else ""
+
+        m = CN8_RE.search(get(i_cn))
+        if not m:
+            continue
+        cn8 = m.group(1)
+
+        if SKIP_RE.search(" ".join(str(c) for c in row if c)):
+            continue
+
+        value = clean_num(get(i_val))
+        if value is None or value <= 0:
+            continue
+
+        qty_raw = clean_num(get(i_qty))
+        qty     = int(qty_raw) if qty_raw is not None else 0
+
+        art_cell  = get(0)
+        wm        = WEIGHT_RE.search(art_cell)
+        weight_kg = round(int(wm.group(1)) / 1000, 4) if wm else None
+
+        mm      = MADE_IN_RE.search(art_cell)
+        made_in = mm.group(1).upper() if mm else ""
+
+        lines.append({
+            "pn": pn, "cn8": cn8, "qty": qty,
+            "value": value, "weight_kg": weight_kg, "made_in": made_in,
+        })
+
 # ---------------------------------------------------------------------------
-# PDF parser
+# PDF parser — PyMuPDF pad (Render)
 # ---------------------------------------------------------------------------
 
-def parse_pdf(pdf_bytes):
+def _parse_with_pymupdf(pdf_bytes):
+    lines            = []
+    meta             = {"factuurnummer": "", "datum": "", "leverancier": ""}
+    total_candidates = []
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        for pn in range(len(doc)):
+            page      = doc[pn]
+            page_text = page.get_text()
+
+            _update_meta(meta, page_text)
+            for pat in TOTAL_PATTERNS:
+                for m in re.finditer(pat, page_text, re.IGNORECASE | re.MULTILINE):
+                    v = clean_num(m.group(1))
+                    if v and v > 100:
+                        total_candidates.append(round(v, 2))
+
+            try:
+                finder = page.find_tables()
+                for tab in finder.tables:
+                    _process_raw_table(tab.extract(), lines, pn + 1)
+            except Exception as te:
+                logger.warning("Tabel pagina %d overgeslagen: %s", pn + 1, te)
+
+            page = None
+            gc.collect()
+    finally:
+        doc.close()
+
+    return lines, total_candidates, meta
+
+
+# ---------------------------------------------------------------------------
+# PDF parser — pdfplumber pad (lokaal)
+# ---------------------------------------------------------------------------
+
+def _parse_with_pdfplumber(pdf_bytes):
     lines            = []
     meta             = {"factuurnummer": "", "datum": "", "leverancier": ""}
     total_candidates = []
@@ -192,73 +314,7 @@ def parse_pdf(pdf_bytes):
                         total_candidates.append(round(v, 2))
 
             for table in page.extract_tables():
-                if not table or len(table) < 2:
-                    continue
-                raw = [[str(c).strip() if c else "" for c in r] for r in table]
-
-                hkw  = re.compile(r"(quantity|price|discount|value)", re.I)
-                hidx = 0
-                for i, row in enumerate(raw[:5]):
-                    if sum(1 for c in row if hkw.search(c)) >= 3:
-                        hidx = i
-                        break
-                hdrs = [h.lower() for h in raw[hidx]]
-
-                has_val = any(
-                    "value" in h and "taxable" not in h and "free" not in h
-                    for h in hdrs
-                )
-                if not has_val:
-                    continue
-
-                def find_col(patterns, exclude=None):
-                    for i, h in enumerate(hdrs):
-                        if exclude and any(e in h for e in exclude):
-                            continue
-                        if any(p in h for p in patterns):
-                            return i
-                    return None
-
-                i_cn  = find_col(["customs"])
-                i_qty = find_col(["quantity"])
-                i_val = find_col(["value"], exclude=["taxable", "free"])
-
-                if i_val is None:
-                    continue
-
-                for row in raw[hidx + 1:]:
-                    if not any(row):
-                        continue
-
-                    def get(idx):
-                        return row[idx] if idx is not None and idx < len(row) else ""
-
-                    m = CN8_RE.search(get(i_cn))
-                    if not m:
-                        continue
-                    cn8 = m.group(1)
-
-                    if SKIP_RE.search(" ".join(row)):
-                        continue
-
-                    value = clean_num(get(i_val))
-                    if value is None or value <= 0:
-                        continue
-
-                    qty_raw = clean_num(get(i_qty))
-                    qty     = int(qty_raw) if qty_raw is not None else 0
-
-                    art_cell  = get(0)
-                    wm        = WEIGHT_RE.search(art_cell)
-                    weight_kg = round(int(wm.group(1)) / 1000, 4) if wm else None
-
-                    mm      = MADE_IN_RE.search(art_cell)
-                    made_in = mm.group(1).upper() if mm else ""
-
-                    lines.append({
-                        "pn": pn, "cn8": cn8, "qty": qty,
-                        "value": value, "weight_kg": weight_kg, "made_in": made_in,
-                    })
+                _process_raw_table(table, lines, pn)
 
             try:
                 page.flush_cache()
@@ -266,6 +322,19 @@ def parse_pdf(pdf_bytes):
                 pass
             del page_text
             gc.collect()
+
+    return lines, total_candidates, meta
+
+
+# ---------------------------------------------------------------------------
+# Hoofd-parser: kiest automatisch de juiste bibliotheek
+# ---------------------------------------------------------------------------
+
+def parse_pdf(pdf_bytes):
+    if USE_PYMUPDF:
+        lines, total_candidates, meta = _parse_with_pymupdf(pdf_bytes)
+    else:
+        lines, total_candidates, meta = _parse_with_pdfplumber(pdf_bytes)
 
     pdf_total = (Counter(total_candidates).most_common(1)[0][0]
                  if total_candidates else None)

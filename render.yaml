@@ -3,7 +3,7 @@ services:
     name: intrastat-pdf-extractor
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    startCommand: gunicorn app:app --timeout 120 --workers 1
     plan: free
     envVars:
       - key: PYTHON_VERSION
