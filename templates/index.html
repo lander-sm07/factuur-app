@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="nl">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Intrastat Factuur Import</title>
+  <title>Intrastat PDF Extractor</title>
   <style>
     /* ── Reset & base ──────────────────────────────────────────────────────── */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -382,8 +382,8 @@
 
   <!-- ── Header ──────────────────────────────────────────────────────────── -->
   <header>
-    <h1>Intrastat Factuur Import</h1>
-    <p>Upload een aankoopfactuur (PDF) en ontvang een kant-en-klaar Intrastat Excel-bestand</p>
+    <h1>Intrastat PDF Extractor</h1>
+    <p>Upload a purchase invoice (PDF) and receive a ready-to-use Intrastat Excel file</p>
   </header>
 
   <!-- ── Main ────────────────────────────────────────────────────────────── -->
@@ -392,7 +392,7 @@
 
       <!-- Upload section -->
       <div id="upload-section">
-        <p class="section-title">Stap 1 — Kies uw PDF-factuur</p>
+        <p class="section-title">Step 1 — Choose your PDF invoice</p>
 
         <label class="upload-label" for="file-input">
           <div class="drop-zone" id="drop-zone">
@@ -406,8 +406,8 @@
               <line x1="14" y1="22" x2="34" y2="22" stroke="#8b7355" stroke-width="1.5" opacity="0.5" stroke-linecap="round"/>
               <line x1="14" y1="28" x2="30" y2="28" stroke="#8b7355" stroke-width="1.5" opacity="0.5" stroke-linecap="round"/>
             </svg>
-            <p class="hint">Sleep uw PDF hier of klik om te bladeren</p>
-            <p class="sub-hint">Aankoopfacturen met artikelregels · max. 20 MB</p>
+            <p class="hint">Drop your PDF here or click to browse</p>
+            <p class="sub-hint">Purchase invoices with article lines · max. 20 MB</p>
           </div>
         </label>
 
@@ -420,13 +420,13 @@
             <polyline points="14,2 14,8 20,8"/>
           </svg>
           <span id="file-name-text"></span>
-          <button id="remove-file" type="button" title="Verwijder bestand">✕</button>
+          <button id="remove-file" type="button" title="Remove file">✕</button>
         </div>
 
         <hr class="divider" />
-        <p class="section-title">Stap 2 — Verwerk de factuur</p>
+        <p class="section-title">Step 2 — Process the invoice</p>
 
-        <button id="submit-btn" disabled>Verwerk naar Intrastat Excel</button>
+        <button id="submit-btn" disabled>Generate Intrastat Excel</button>
 
         <div id="error-box"></div>
       </div>
@@ -435,22 +435,22 @@
       <div id="progress-section">
         <div class="spinner-wrap">
           <div class="spinner"></div>
-          <p style="color: var(--brown-dark); font-size: 1rem;">Factuur wordt verwerkt…</p>
+          <p style="color: var(--brown-dark); font-size: 1rem;">Processing invoice…</p>
           <div class="progress-bar-wrap" style="width: 100%">
             <div class="progress-bar" id="progress-bar"></div>
           </div>
           <div class="progress-steps">
             <div class="step" id="step-upload">
-              <div class="dot"></div><span>PDF uploaden</span>
+              <div class="dot"></div><span>Uploading PDF</span>
             </div>
             <div class="step" id="step-parse">
-              <div class="dot"></div><span>Tabellen en tekst herkennen</span>
+              <div class="dot"></div><span>Reading PDF</span>
             </div>
             <div class="step" id="step-extract">
-              <div class="dot"></div><span>Artikelregels extraheren</span>
+              <div class="dot"></div><span>Extracting articles</span>
             </div>
             <div class="step" id="step-excel">
-              <div class="dot"></div><span>Intrastat Excel aanmaken</span>
+              <div class="dot"></div><span>Generating Excel</span>
             </div>
           </div>
         </div>
@@ -464,18 +464,51 @@
               <circle cx="12" cy="12" r="10"/>
               <polyline points="9,12 12,15 16,10"/>
             </svg>
-            Verwerking geslaagd!
+            Processing complete!
           </h2>
           <div class="result-meta" id="result-meta"></div>
-          <a id="download-btn" href="#" download>
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-              <polyline points="7,10 12,15 17,10"/>
-              <line x1="12" y1="15" x2="12" y2="3"/>
-            </svg>
-            Download Intrastat Excel (2 tabbladen)
-          </a>
-          <button id="new-upload-btn">↩ Nieuwe factuur uploaden</button>
+
+          <!-- Total + check banner -->
+          <div id="total-banner" style="
+            border-radius: 8px;
+            padding: 12px 18px;
+            margin-bottom: 16px;
+          ">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+              <span style="font-size:0.88rem; color:var(--text-muted); font-style:italic;">
+                Totaal (VALUE uit PDF)
+              </span>
+              <span id="total-eur" style="font-size:1.2rem; font-weight:bold; color:var(--brown-dark); font-family:monospace;"></span>
+            </div>
+            <div id="check-banner" style="
+              font-size: 0.82rem;
+              padding: 6px 10px;
+              border-radius: 6px;
+              font-family: monospace;
+            "></div>
+          </div>
+
+          <!-- Download buttons -->
+          <div style="display:flex; gap:10px; margin-bottom:12px;">
+            <a id="download-excel" href="#" style="flex:1; display:flex; align-items:center; justify-content:center; gap:8px; padding:13px; background:var(--success); color:var(--white); border-radius:var(--radius); font-size:0.95rem; font-family:inherit; cursor:pointer; text-decoration:none; letter-spacing:0.02em; transition:background 0.2s;">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="7,10 12,15 17,10"/>
+                <line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              Download Excel (.xlsx)
+            </a>
+            <a id="download-csv" href="#" style="flex:1; display:flex; align-items:center; justify-content:center; gap:8px; padding:13px; background:var(--brown); color:var(--white); border-radius:var(--radius); font-size:0.95rem; font-family:inherit; cursor:pointer; text-decoration:none; letter-spacing:0.02em; transition:background 0.2s;">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="7,10 12,15 17,10"/>
+                <line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              Download CSV (NBB)
+            </a>
+          </div>
+
+          <button id="new-upload-btn">↩ Upload new invoice</button>
         </div>
       </div>
 
@@ -484,7 +517,7 @@
 
   <!-- ── Footer ──────────────────────────────────────────────────────────── -->
   <footer>
-    Ontwikkeld door <span>Lander Smits</span> &nbsp;·&nbsp; Intrastat Factuur Import App &nbsp;·&nbsp; &copy; <span id="year"></span>
+    Made by <span>Lander Smits</span> &nbsp;·&nbsp; Intrastat PDF Extractor &nbsp;·&nbsp; &copy; <span id="year"></span>
   </footer>
 
   <script>
@@ -503,9 +536,11 @@
     const resultSection  = document.getElementById('result-section');
     const errorBox       = document.getElementById('error-box');
     const progressBar    = document.getElementById('progress-bar');
-    const downloadBtn    = document.getElementById('download-btn');
+    const downloadExcel  = document.getElementById('download-excel');
+    const downloadCsv    = document.getElementById('download-csv');
     const newUploadBtn   = document.getElementById('new-upload-btn');
     const resultMeta     = document.getElementById('result-meta');
+    const totalEur       = document.getElementById('total-eur');
 
     // Year in footer
     document.getElementById('year').textContent = new Date().getFullYear();
@@ -513,11 +548,11 @@
     // ── File selection ─────────────────────────────────────────────────────
     function setFile(file) {
       if (!file || file.type !== 'application/pdf') {
-        showError('Selecteer een geldig PDF-bestand.');
+        showError('Please select a valid PDF file.');
         return;
       }
       if (file.size > 20 * 1024 * 1024) {
-        showError('Het bestand is groter dan 20 MB.');
+        showError('The file exceeds 20 MB.');
         return;
       }
       selectedFile = file;
@@ -604,11 +639,10 @@
     // ── Meta display ───────────────────────────────────────────────────────
     function renderMeta(data) {
       const items = [
-        { label: 'Unieke producten',  value: data.item_count },
-        { label: 'Regels in PDF',     value: data.raw_count },
-        { label: 'Leverancier',       value: data.meta?.leverancier || '—' },
-        { label: 'Factuurnummer',     value: data.meta?.factuurnummer || '—' },
-        { label: 'Datum factuur',     value: data.meta?.datum || '—' },
+        { label: 'Unieke CN-codes',  value: data.item_count },
+        { label: 'PDF-lijnen',       value: data.raw_lines },
+        { label: 'Factuurnummer',    value: data.meta?.factuurnummer || '—' },
+        { label: 'Datum',            value: data.meta?.datum || '—' },
       ];
       resultMeta.innerHTML = items.map(i => `
         <div class="meta-item">
@@ -616,6 +650,30 @@
           <div class="value">${i.value}</div>
         </div>
       `).join('');
+
+      // Totaal
+      const fmt = new Intl.NumberFormat('nl-BE', { style:'currency', currency:'EUR' });
+      totalEur.textContent = fmt.format(data.total_eur);
+
+      // Dubbelcheck banner
+      const cb = document.getElementById('check-banner');
+      if (data.check_ok) {
+        cb.style.background = '#edf7ea';
+        cb.style.border     = '1px solid #a8d5a0';
+        cb.style.color      = '#3a6e32';
+      } else {
+        cb.style.background = '#fdf0f0';
+        cb.style.border     = '1px solid #d9a0a0';
+        cb.style.color      = '#8b2020';
+      }
+      cb.textContent = data.check_msg;
+
+      // Stel banner-achtergrond in op basis van check
+      const tb = document.getElementById('total-banner');
+      tb.style.background = data.check_ok ? 'var(--beige-mid)' : '#fdf0f0';
+      tb.style.border     = data.check_ok
+        ? '1.5px solid var(--beige-dark)'
+        : '1.5px solid #d9a0a0';
     }
 
     // ── Submit ─────────────────────────────────────────────────────────────
@@ -649,7 +707,7 @@
       } catch (err) {
         progressSection.style.display = 'none';
         uploadSection.style.display   = 'block';
-        showError(err.message || 'Er is een onbekende fout opgetreden.');
+        showError(err.message || 'An unknown error occurred.');
         return;
       }
 
@@ -662,8 +720,10 @@
       resultSection.style.display   = 'block';
 
       renderMeta(data);
-      downloadBtn.href = `/download/${data.token}`;
-      downloadBtn.download = data.filename;
+      downloadExcel.href     = `/download/${data.token}/excel`;
+      downloadExcel.download = data.xlsx_name;
+      downloadCsv.href       = `/download/${data.token}/csv`;
+      downloadCsv.download   = data.csv_name;
     });
 
     // ── New upload ─────────────────────────────────────────────────────────
