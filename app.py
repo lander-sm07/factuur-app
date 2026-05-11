@@ -2,7 +2,7 @@
 Intrastat PDF Extractor  —  NBB/Intrastat Excel + CSV generator
 Auteur: Lander Smits
 
-Geheugenoptimalisatie: pagina-voor-pagina verwerking met gc.collect() per pagina.
+PDF-verwerking via PyMuPDF (fitz) — veel lichter qua geheugen dan pdfplumber.
 Beveiliging: APP_PASSWORD env-var + Flask-sessies.
 """
 import csv
@@ -19,7 +19,7 @@ from collections import Counter, OrderedDict
 from datetime import datetime
 from functools import wraps
 
-import pdfplumber
+import fitz  # PyMuPDF
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -39,7 +39,7 @@ STORE_LOCK   = threading.Lock()
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 
 # ---------------------------------------------------------------------------
-# Auto-opruiming: resultaten ouder dan 10 min
+# Auto-opruiming
 # ---------------------------------------------------------------------------
 
 def _cleanup_loop():
@@ -101,6 +101,13 @@ FIXED_INCOTERM = "EXW Af fabriek"
 FIXED_VERVOER  = "3 Wegvervoer"
 NO_SUPPL_PREFIXES = ("42",)
 
+TOTAL_PATTERNS = [
+    r"Non\s+imp\.?\s+Art\s+\d+\s+\S+\s+\S+\s+([\d.,]+)",
+    r"EUR\s+([\d]{2,3}[.,]\d{3}[.,]\d{2})",
+    r"TOTAL\s+FREE\s+([\d.,]+)",
+    r"\bVAT\b\s+([\d]{2,3}[.,]\d{3}[.,]\d{2})",
+]
+
 # ---------------------------------------------------------------------------
 # Regex
 # ---------------------------------------------------------------------------
@@ -114,12 +121,6 @@ SKIP_RE    = re.compile(
     r"taxable|exempt|tva|^vat|intracommunautair)",
     re.IGNORECASE,
 )
-TOTAL_PATTERNS = [
-    r"Non\s+imp\.?\s+Art\s+\d+\s+\S+\s+\S+\s+([\d.,]+)",
-    r"EUR\s+([\d]{2,3}[.,]\d{3}[.,]\d{2})",
-    r"TOTAL\s+FREE\s+([\d.,]+)",
-    r"\bVAT\b\s+([\d]{2,3}[.,]\d{3}[.,]\d{2})",
-]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -151,7 +152,6 @@ def has_suppl_unit(cn8):
 
 
 def _update_meta(meta, text):
-    """Vul meta-velden in vanuit paginatekst (stopt zodra alles gevonden is)."""
     if not meta["factuurnummer"]:
         for pat in [
             r"(?:factuur|invoice|fattura)\s*(?:nr|number|no|n)?\.?\s*:?\s*([A-Z0-9\-/_]{3,30})",
@@ -179,24 +179,101 @@ def _update_meta(meta, text):
                 break
 
 # ---------------------------------------------------------------------------
-# PDF parser — pagina-voor-pagina, geheugenefficiënt
+# PDF parser — PyMuPDF, pagina-voor-pagina
 # ---------------------------------------------------------------------------
+
+def _process_table(raw_table, lines, pn):
+    """Verwerk een ruwe tabel (list of list of str) naar productlijnen."""
+    if not raw_table or len(raw_table) < 2:
+        return
+
+    # Zoek headerrij
+    hkw  = re.compile(r"(quantity|price|discount|value)", re.I)
+    hidx = 0
+    for i, row in enumerate(raw_table[:5]):
+        if sum(1 for c in (row or []) if c and hkw.search(str(c))) >= 3:
+            hidx = i
+            break
+
+    hdrs = [str(c).lower().strip() if c else "" for c in raw_table[hidx]]
+
+    has_val = any(
+        "value" in h and "taxable" not in h and "free" not in h
+        for h in hdrs
+    )
+    if not has_val:
+        return
+
+    def find_col(patterns, exclude=None):
+        for i, h in enumerate(hdrs):
+            if exclude and any(e in h for e in exclude):
+                continue
+            if any(p in h for p in patterns):
+                return i
+        return None
+
+    i_cn  = find_col(["customs"])
+    i_qty = find_col(["quantity"])
+    i_val = find_col(["value"], exclude=["taxable", "free"])
+
+    if i_val is None:
+        return
+
+    for row in raw_table[hidx + 1:]:
+        if not row or not any(row):
+            continue
+
+        def get(idx):
+            if idx is None or idx >= len(row):
+                return ""
+            return str(row[idx]).strip() if row[idx] is not None else ""
+
+        m = CN8_RE.search(get(i_cn))
+        if not m:
+            continue
+        cn8 = m.group(1)
+
+        if SKIP_RE.search(" ".join(str(c) for c in row if c)):
+            continue
+
+        value = clean_num(get(i_val))
+        if value is None or value <= 0:
+            continue
+
+        qty_raw = clean_num(get(i_qty))
+        qty     = int(qty_raw) if qty_raw is not None else 0
+
+        art_cell  = get(0)
+        wm        = WEIGHT_RE.search(art_cell)
+        weight_kg = round(int(wm.group(1)) / 1000, 4) if wm else None
+
+        mm      = MADE_IN_RE.search(art_cell)
+        made_in = mm.group(1).upper() if mm else ""
+
+        lines.append({
+            "pn": pn, "cn8": cn8, "qty": qty,
+            "value": value, "weight_kg": weight_kg, "made_in": made_in,
+        })
+
 
 def parse_pdf(pdf_bytes):
     """
-    Verwerkt de PDF pagina-voor-pagina.
-    Na elke pagina wordt cache geleegd en gc.collect() aangeroepen.
+    Verwerkt PDF via PyMuPDF (fitz).
+    Veel lichter qua geheugen dan pdfplumber.
     Retourneert (lines, pdf_total, meta).
     """
-    lines             = []
-    meta              = {"factuurnummer": "", "datum": "", "leverancier": ""}
-    total_candidates  = []
+    lines            = []
+    meta             = {"factuurnummer": "", "datum": "", "leverancier": ""}
+    total_candidates = []
 
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for pn, page in enumerate(pdf.pages, 1):
-            page_text = page.extract_text() or ""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-            # Meta & totaal uit tekst halen
+    try:
+        for pn in range(len(doc)):
+            page      = doc[pn]
+            page_text = page.get_text()
+
+            # Meta en totaal uit tekst
             _update_meta(meta, page_text)
             for pat in TOTAL_PATTERNS:
                 for m in re.finditer(pat, page_text, re.IGNORECASE | re.MULTILINE):
@@ -204,83 +281,23 @@ def parse_pdf(pdf_bytes):
                     if v and v > 100:
                         total_candidates.append(round(v, 2))
 
-            # Tabellen verwerken
-            for table in page.extract_tables():
-                if not table or len(table) < 2:
-                    continue
-                raw = [[str(c).strip() if c else "" for c in r] for r in table]
-
-                hkw  = re.compile(r"(quantity|price|discount|value)", re.I)
-                hidx = 0
-                for i, row in enumerate(raw[:5]):
-                    if sum(1 for c in row if hkw.search(c)) >= 3:
-                        hidx = i
-                        break
-                hdrs = [h.lower() for h in raw[hidx]]
-
-                has_val = any(
-                    "value" in h and "taxable" not in h and "free" not in h
-                    for h in hdrs
-                )
-                if not has_val:
-                    continue
-
-                def find_col(patterns, exclude=None):
-                    for i, h in enumerate(hdrs):
-                        if exclude and any(e in h for e in exclude):
-                            continue
-                        if any(p in h for p in patterns):
-                            return i
-                    return None
-
-                i_cn  = find_col(["customs"])
-                i_qty = find_col(["quantity"])
-                i_val = find_col(["value"], exclude=["taxable", "free"])
-
-                if i_val is None:
-                    continue
-
-                for row in raw[hidx + 1:]:
-                    if not any(row):
-                        continue
-
-                    def get(idx):
-                        return row[idx] if idx is not None and idx < len(row) else ""
-
-                    m = CN8_RE.search(get(i_cn))
-                    if not m:
-                        continue
-                    cn8 = m.group(1)
-
-                    if SKIP_RE.search(" ".join(row)):
-                        continue
-
-                    value = clean_num(get(i_val))
-                    if value is None or value <= 0:
-                        continue
-
-                    qty_raw = clean_num(get(i_qty))
-                    qty     = int(qty_raw) if qty_raw is not None else 0
-
-                    art_cell  = get(0)
-                    wm        = WEIGHT_RE.search(art_cell)
-                    weight_kg = round(int(wm.group(1)) / 1000, 4) if wm else None
-
-                    mm      = MADE_IN_RE.search(art_cell)
-                    made_in = mm.group(1).upper() if mm else ""
-
-                    lines.append({
-                        "pn": pn, "cn8": cn8, "qty": qty,
-                        "value": value, "weight_kg": weight_kg, "made_in": made_in,
-                    })
-
-            # Geheugen vrijgeven na elke pagina
+            # Tabelextractie via PyMuPDF
             try:
-                page.flush_cache()
-            except Exception:
-                pass
-            del page_text
+                finder = page.find_tables()
+                for tab in finder.tables:
+                    raw = tab.extract()
+                    _process_table(raw, lines, pn + 1)
+            except Exception as te:
+                logger.warning("Tabel pagina %d overgeslagen: %s", pn + 1, te)
+
+            # Geheugen vrijgeven
+            page = None
             gc.collect()
+
+    finally:
+        doc.close()
+        del pdf_bytes
+        gc.collect()
 
     pdf_total = (Counter(total_candidates).most_common(1)[0][0]
                  if total_candidates else None)
@@ -342,8 +359,8 @@ def _side(color="D4C5A9"):
 
 
 def build_excel(nbb_rows, meta):
-    wb    = openpyxl.Workbook()
-    ws    = wb.active
+    wb = openpyxl.Workbook()
+    ws = wb.active
     ws.title = "Intrastat"
     ncols = len(HEADERS)
 
@@ -355,9 +372,9 @@ def build_excel(nbb_rows, meta):
     ws.row_dimensions[1].height = 26
 
     parts = []
-    if meta.get("leverancier"): parts.append("Leverancier: " + meta["leverancier"])
-    if meta.get("factuurnummer"): parts.append("Factuurnr: " + meta["factuurnummer"])
-    if meta.get("datum"):       parts.append("Datum: " + meta["datum"])
+    if meta.get("leverancier"):   parts.append("Leverancier: " + meta["leverancier"])
+    if meta.get("factuurnummer"): parts.append("Factuurnr: "   + meta["factuurnummer"])
+    if meta.get("datum"):         parts.append("Datum: "       + meta["datum"])
 
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=6)
     ws.cell(row=2, column=1, value="   ".join(parts))
@@ -384,7 +401,7 @@ def build_excel(nbb_rows, meta):
         ws.column_dimensions[get_column_letter(ci)].width = width
     ws.row_dimensions[HR].height = 24
 
-    DS     = HR + 1
+    DS = HR + 1
     fmt_kg = "#,##0.000"
     fmt_eu = "#,##0.00"
     fmt_qt = "#,##0"
@@ -399,13 +416,13 @@ def build_excel(nbb_rows, meta):
                 row["aanv_eenheden"], row["aanv_eenh"]]
         for ci, v in enumerate(vals, 1):
             c = ws.cell(row=r, column=ci, value=v)
-            c.fill      = fill; c.border = brd
+            c.fill = fill; c.border = brd
             c.alignment = Alignment(vertical="center",
                                     horizontal="right" if ci in (7, 8, 9, 10) else "left",
                                     wrap_text=(ci == 4))
-            if ci == 7 and isinstance(v, (int, float)):    c.number_format = fmt_kg
-            if ci in (8, 9) and isinstance(v, (int, float)): c.number_format = fmt_eu
-            if ci == 10 and isinstance(v, (int, float)):   c.number_format = fmt_qt
+            if ci == 7 and isinstance(v, (int, float)):       c.number_format = fmt_kg
+            if ci in (8, 9) and isinstance(v, (int, float)):  c.number_format = fmt_eu
+            if ci == 10 and isinstance(v, (int, float)):      c.number_format = fmt_qt
         ws.row_dimensions[r].height = 15
 
     TR  = DS + len(nbb_rows)
@@ -426,7 +443,7 @@ def build_excel(nbb_rows, meta):
         cell.alignment = Alignment(horizontal="right", vertical="center")
     ws.row_dimensions[TR].height = 20
 
-    ws.freeze_panes  = ws.cell(row=DS, column=1)
+    ws.freeze_panes = ws.cell(row=DS, column=1)
     ws.auto_filter.ref = (get_column_letter(1) + str(HR) + ":" +
                           get_column_letter(ncols) + str(TR - 1))
     buf = io.BytesIO()
@@ -477,11 +494,9 @@ def index():
 def upload():
     if "pdf" not in request.files:
         return jsonify({"error": "Geen bestand ontvangen."}), 400
-
     file = request.files["pdf"]
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         return jsonify({"error": "Upload een geldig PDF-bestand."}), 400
-
     pdf_bytes = file.read()
     if not pdf_bytes:
         return jsonify({"error": "Het bestand is leeg."}), 400
@@ -491,9 +506,6 @@ def upload():
     except Exception as exc:
         logger.exception("PDF verwerking mislukt")
         return jsonify({"error": "Fout bij verwerken: " + str(exc)}), 500
-    finally:
-        del pdf_bytes
-        gc.collect()
 
     if not lines:
         return jsonify({"error": (
