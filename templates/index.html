@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Intrastat PDF Extractor</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --beige-light:  #f7f2ea;
+      --beige-mid:    #ede5d3;
+      --beige-dark:   #d4c5a9;
+      --brown-light:  #c9a96e;
+      --brown:        #8b7355;
+      --brown-dark:   #5c4a32;
+      --text:         #3d3229;
+      --text-muted:   #7a6a56;
+      --white:        #fefcf9;
+      --success:      #5a7a4e;
+      --error:        #9b3a3a;
+      --radius:       12px;
+      --shadow:       0 4px 24px rgba(61,50,41,0.10);
+    }
+
+    html, body { height: 100%; font-family: 'Georgia', 'Times New Roman', serif; background: var(--beige-light); color: var(--text); }
+    body { display: flex; flex-direction: column; min-height: 100vh; }
+
+    header {
+      background: var(--brown);
+      color: var(--white);
+      padding: 28px 24px 22px;
+      text-align: center;
+      box-shadow: 0 2px 12px rgba(61,50,41,0.18);
+    }
+    header h1 { font-size: 2rem; font-weight: normal; letter-spacing: 0.04em; }
+    header p  { margin-top: 6px; font-size: 0.95rem; color: var(--beige-mid); font-style: italic; }
+
+    main { flex: 1; display: flex; align-items: flex-start; justify-content: center; padding: 48px 20px 60px; }
+
+    .card {
+      background: var(--white);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      border: 1px solid var(--beige-dark);
+      width: 100%; max-width: 660px;
+      padding: 40px 44px;
+    }
+
+    .upload-label { display: block; cursor: pointer; }
+
+    .drop-zone {
+      border: 2.5px dashed var(--beige-dark);
+      border-radius: var(--radius);
+      background: var(--beige-light);
+      padding: 52px 24px;
+      text-align: center;
+      transition: border-color 0.2s, background 0.2s;
+    }
+    .drop-zone.drag-over { border-color: var(--brown-light); background: var(--beige-mid); }
+    .drop-zone svg { display: block; margin: 0 auto 18px; opacity: 0.55; }
+    .drop-zone .hint { font-size: 1.05rem; color: var(--brown-dark); font-weight: bold; }
+    .drop-zone .sub-hint { font-size: 0.85rem; color: var(--text-muted); margin-top: 6px; font-style: italic; }
+
+    #file-input { display: none; }
+
+    #file-pill {
+      display: none; margin-top: 14px;
+      align-items: center; gap: 10px;
+      background: var(--beige-mid);
+      border-radius: 40px; padding: 8px 16px;
+      font-size: 0.9rem; color: var(--brown-dark);
+    }
+    #file-pill svg { flex-shrink: 0; }
+    #file-pill span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #remove-file { background: none; border: none; cursor: pointer; color: var(--text-muted); padding: 0; line-height: 1; font-size: 1.1rem; }
+    #remove-file:hover { color: var(--error); }
+
+    #submit-btn {
+      margin-top: 28px; width: 100%; padding: 15px;
+      background: var(--brown); color: var(--white);
+      border: none; border-radius: var(--radius);
+      font-size: 1.05rem; font-family: inherit;
+      cursor: pointer; letter-spacing: 0.03em;
+      transition: background 0.2s, transform 0.1s;
+    }
+    #submit-btn:hover:not(:disabled) { background: var(--brown-dark); }
+    #submit-btn:active:not(:disabled) { transform: scale(0.98); }
+    #submit-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+    #progress-section { display: none; margin-top: 32px; text-align: center; }
+    .spinner-wrap { display: flex; flex-direction: column; align-items: center; gap: 16px; }
+    .spinner { width: 52px; height: 52px; border: 5px solid var(--beige-dark); border-top-color: var(--brown); border-radius: 50%; animation: spin 0.9s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .progress-bar-wrap { width: 100%; background: var(--beige-mid); border-radius: 40px; height: 8px; overflow: hidden; margin-top: 4px; }
+    .progress-bar { height: 100%; background: linear-gradient(90deg, var(--brown-light), var(--brown)); border-radius: 40px; width: 0%; transition: width 0.4s ease; }
+
+    .progress-steps { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; text-align: left; font-size: 0.88rem; color: var(--text-muted); }
+    .step { display: flex; align-items: center; gap: 8px; opacity: 0.4; transition: opacity 0.3s; }
+    .step.active { opacity: 1; color: var(--brown-dark); }
+    .step.done   { opacity: 0.75; color: var(--success); }
+    .step .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--beige-dark); flex-shrink: 0; transition: background 0.3s; }
+    .step.active .dot { background: var(--brown-light); }
+    .step.done   .dot { background: var(--success); }
+
+    #result-section { display: none; margin-top: 32px; }
+    .result-box { border: 1.5px solid var(--beige-dark); border-radius: var(--radius); padding: 24px; background: var(--beige-light); }
+    .result-box h2 { font-size: 1.1rem; color: var(--success); margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+
+    .result-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 20px; }
+    .meta-item { background: var(--white); border-radius: 8px; border: 1px solid var(--beige-dark); padding: 10px 14px; }
+    .meta-item .label { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; font-style: italic; }
+    .meta-item .value { font-size: 1rem; font-weight: bold; color: var(--brown-dark); margin-top: 2px; }
+
+    #error-box {
+      display: none; margin-top: 20px;
+      padding: 16px 20px;
+      background: #fdf0f0; border: 1.5px solid #d9a0a0;
+      border-radius: var(--radius); color: var(--error); font-size: 0.92rem;
+    }
+
+    .divider { border: none; border-top: 1px solid var(--beige-dark); margin: 28px 0; }
+    .section-title { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-muted); margin-bottom: 14px; font-style: italic; }
+
+    #new-upload-btn {
+      margin-top: 12px; width: 100%; padding: 10px;
+      background: none; color: var(--text-muted);
+      border: 1.5px solid var(--beige-dark); border-radius: var(--radius);
+      font-size: 0.9rem; font-family: inherit; cursor: pointer;
+      transition: border-color 0.2s, color 0.2s;
+    }
+    #new-upload-btn:hover { border-color: var(--brown-light); color: var(--brown); }
+
+    footer { background: var(--brown-dark); color: var(--beige-mid); text-align: center; padding: 18px 24px; font-size: 0.85rem; letter-spacing: 0.03em; }
+    footer span { color: var(--brown-light); font-weight: bold; }
+
+    @media (max-width: 560px) { .card { padding: 28px 20px; } header h1 { font-size: 1.5rem; } }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>Intrastat PDF Extractor</h1>
+    <p>Upload a purchase invoice (PDF) and receive a ready-to-use Intrastat Excel file</p>
+  </header>
+
+  <main>
+    <div class="card">
+
+      <!-- Upload section -->
+      <div id="upload-section">
+        <p class="section-title">Step 1 — Choose your PDF invoice</p>
+        <label class="upload-label" for="file-input">
+          <div class="drop-zone" id="drop-zone">
+            <svg width="56" height="56" viewBox="0 0 56 56" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <rect x="8" y="4" width="32" height="42" rx="3" fill="#c9a96e" opacity="0.25"/>
+              <rect x="10" y="6" width="28" height="38" rx="2" fill="#c9a96e" opacity="0.4"/>
+              <path d="M32 6v10h10" stroke="#8b7355" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              <rect x="8" y="4" width="32" height="42" rx="3" stroke="#8b7355" stroke-width="2" fill="none"/>
+              <text x="28" y="35" font-size="9" fill="#8b7355" text-anchor="middle" font-family="Georgia,serif" font-weight="bold">PDF</text>
+              <line x1="14" y1="22" x2="34" y2="22" stroke="#8b7355" stroke-width="1.5" opacity="0.5" stroke-linecap="round"/>
+              <line x1="14" y1="28" x2="30" y2="28" stroke="#8b7355" stroke-width="1.5" opacity="0.5" stroke-linecap="round"/>
+            </svg>
+            <p class="hint">Drop your PDF here or click to browse</p>
+            <p class="sub-hint">Purchase invoices with article lines · max. 20 MB</p>
+          </div>
+        </label>
+
+        <input type="file" id="file-input" accept=".pdf" />
+
+        <div id="file-pill">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#8b7355" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14,2 14,8 20,8"/>
+          </svg>
+          <span id="file-name-text"></span>
+          <button id="remove-file" type="button" title="Remove file">✕</button>
+        </div>
+
+        <hr class="divider" />
+        <p class="section-title">Step 2 — Process the invoice</p>
+        <button id="submit-btn" disabled>Generate Intrastat Excel</button>
+        <div id="error-box"></div>
+      </div>
+
+      <!-- Progress section -->
+      <div id="progress-section">
+        <div class="spinner-wrap">
+          <div class="spinner"></div>
+          <p style="color: var(--brown-dark); font-size: 1rem;">Processing invoice…</p>
+          <div class="progress-bar-wrap" style="width: 100%">
+            <div class="progress-bar" id="progress-bar"></div>
+          </div>
+          <div class="progress-steps">
+            <div class="step" id="step-upload"><div class="dot"></div><span>Uploading PDF</span></div>
+            <div class="step" id="step-parse"><div class="dot"></div><span>Reading PDF</span></div>
+            <div class="step" id="step-extract"><div class="dot"></div><span>Extracting articles</span></div>
+            <div class="step" id="step-excel"><div class="dot"></div><span>Generating Excel</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Result section -->
+      <div id="result-section">
+        <div class="result-box">
+          <h2>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"/><polyline points="9,12 12,15 16,10"/>
+            </svg>
+            Processing complete!
+          </h2>
+
+          <div class="result-meta" id="result-meta"></div>
+
+          <!-- Total + dubbelcheck banner -->
+          <div id="total-banner" style="border-radius:8px; padding:12px 18px; margin-bottom:16px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+              <span style="font-size:0.88rem; color:var(--text-muted); font-style:italic;">Totaal (VALUE uit PDF)</span>
+              <span id="total-eur" style="font-size:1.2rem; font-weight:bold; color:var(--brown-dark); font-family:monospace;"></span>
+            </div>
+            <div id="check-banner" style="font-size:0.82rem; padding:6px 10px; border-radius:6px; font-family:monospace;"></div>
+          </div>
+
+          <!-- Download buttons -->
+          <div style="display:flex; gap:10px; margin-bottom:12px;">
+            <a id="download-excel" href="#" style="flex:1; display:flex; align-items:center; justify-content:center; gap:8px; padding:13px; background:var(--success); color:var(--white); border-radius:var(--radius); font-size:0.95rem; font-family:inherit; cursor:pointer; text-decoration:none; transition:background 0.2s;">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7,10 12,15 17,10"/><line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              Download Excel (.xlsx)
+            </a>
+            <a id="download-csv" href="#" style="flex:1; display:flex; align-items:center; justify-content:center; gap:8px; padding:13px; background:var(--brown); color:var(--white); border-radius:var(--radius); font-size:0.95rem; font-family:inherit; cursor:pointer; text-decoration:none; transition:background 0.2s;">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7,10 12,15 17,10"/><line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              Download CSV (NBB)
+            </a>
+          </div>
+
+          <button id="new-upload-btn">↩ Upload new invoice</button>
+        </div>
+      </div>
+
+    </div>
+  </main>
+
+  <footer>
+    Made by <span>Lander Smits</span> &nbsp;·&nbsp; Intrastat PDF Extractor &nbsp;·&nbsp; &copy; <span id="year"></span>
+  </footer>
+
+  <script>
+    document.getElementById('year').textContent = new Date().getFullYear();
+
+    let selectedFile = null;
+
+    const fileInput       = document.getElementById('file-input');
+    const dropZone        = document.getElementById('drop-zone');
+    const filePill        = document.getElementById('file-pill');
+    const fileNameText    = document.getElementById('file-name-text');
+    const removeFileBtn   = document.getElementById('remove-file');
+    const submitBtn       = document.getElementById('submit-btn');
+    const uploadSection   = document.getElementById('upload-section');
+    const progressSection = document.getElementById('progress-section');
+    const resultSection   = document.getElementById('result-section');
+    const errorBox        = document.getElementById('error-box');
+    const progressBar     = document.getElementById('progress-bar');
+    const downloadExcel   = document.getElementById('download-excel');
+    const downloadCsv     = document.getElementById('download-csv');
+    const resultMeta      = document.getElementById('result-meta');
+    const newUploadBtn    = document.getElementById('new-upload-btn');
+
+    // ── File selection ─────────────────────────────────────────────────────
+    function setFile(file) {
+      if (!file.name.toLowerCase().endsWith('.pdf')) {
+        showError('Please select a PDF file.'); return;
+      }
+      selectedFile = file;
+      fileNameText.textContent = file.name;
+      filePill.style.display = 'flex';
+      submitBtn.disabled = false;
+      hideError();
+    }
+
+    function clearFile() {
+      selectedFile = null;
+      fileInput.value = '';
+      filePill.style.display = 'none';
+      submitBtn.disabled = true;
+    }
+
+    fileInput.addEventListener('change', () => { if (fileInput.files[0]) setFile(fileInput.files[0]); });
+    removeFileBtn.addEventListener('click', (e) => { e.preventDefault(); clearFile(); });
+
+    // ── Drag & drop ────────────────────────────────────────────────────────
+    ['dragenter', 'dragover'].forEach(evt => dropZone.addEventListener(evt, (e) => { e.preventDefault(); dropZone.classList.add('drag-over'); }));
+    ['dragleave', 'drop'].forEach(evt => dropZone.addEventListener(evt, (e) => { e.preventDefault(); dropZone.classList.remove('drag-over'); }));
+    dropZone.addEventListener('drop', (e) => { const f = e.dataTransfer.files[0]; if (f) setFile(f); });
+
+    // ── Progress animation ─────────────────────────────────────────────────
+    const steps = ['step-upload', 'step-parse', 'step-extract', 'step-excel'];
+
+    function animateProgress() {
+      const durations = [400, 800, 700, 600];
+      const widths    = [20, 45, 72, 92];
+      let idx = 0;
+      function nextStep() {
+        if (idx > 0) document.getElementById(steps[idx - 1]).className = 'step done';
+        if (idx < steps.length) {
+          document.getElementById(steps[idx]).className = 'step active';
+          progressBar.style.width = widths[idx] + '%';
+          idx++;
+          setTimeout(nextStep, durations[idx - 1] || 600);
+        }
+      }
+      nextStep();
+    }
+
+    function finishProgress() {
+      steps.forEach(s => document.getElementById(s).className = 'step done');
+      progressBar.style.width = '100%';
+    }
+
+    // ── Error helpers ──────────────────────────────────────────────────────
+    function showError(msg) { errorBox.textContent = msg; errorBox.style.display = 'block'; }
+    function hideError()    { errorBox.style.display = 'none'; }
+
+    // ── Meta display ───────────────────────────────────────────────────────
+    function renderMeta(data) {
+      const items = [
+        { label: 'Unieke CN-codes', value: data.item_count },
+        { label: 'PDF-lijnen',      value: data.raw_lines },
+        { label: 'Factuurnummer',   value: data.meta?.factuurnummer || '—' },
+        { label: 'Datum',           value: data.meta?.datum || '—' },
+      ];
+      resultMeta.innerHTML = items.map(i => `
+        <div class="meta-item">
+          <div class="label">${i.label}</div>
+          <div class="value">${i.value}</div>
+        </div>`).join('');
+    }
+
+    // ── Total & check banner ───────────────────────────────────────────────
+    function renderTotal(data) {
+      const fmt = new Intl.NumberFormat('nl-BE', { style: 'currency', currency: 'EUR' });
+      document.getElementById('total-eur').textContent = fmt.format(data.total_eur);
+
+      const banner = document.getElementById('check-banner');
+      const wrap   = document.getElementById('total-banner');
+      if (data.check_ok) {
+        wrap.style.background   = '#edf5eb';
+        wrap.style.border       = '1px solid #b0d4a8';
+        banner.style.background = '#d4edce';
+        banner.style.color      = '#3a6b30';
+        banner.textContent      = '✓ ' + data.check_msg;
+      } else {
+        wrap.style.background   = '#fdf0f0';
+        wrap.style.border       = '1px solid #d9a0a0';
+        banner.style.background = '#f8d7d7';
+        banner.style.color      = '#8b3a2f';
+        banner.textContent      = '✗ ' + data.check_msg;
+      }
+    }
+
+    // ── Main upload handler ────────────────────────────────────────────────
+    submitBtn.addEventListener('click', async () => {
+      if (!selectedFile) return;
+
+      hideError();
+      uploadSection.style.display   = 'none';
+      progressSection.style.display = 'block';
+      resultSection.style.display   = 'none';
+      animateProgress();
+
+      const formData = new FormData();
+      formData.append('pdf', selectedFile);
+
+      try {
+        const resp = await fetch('/upload', { method: 'POST', body: formData });
+
+        // Session verlopen of niet ingelogd → stuur naar loginpagina
+        if (resp.status === 401 || resp.redirected) {
+          window.location.href = '/login';
+          return;
+        }
+
+        // Controleer of het antwoord JSON is
+        const contentType = resp.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+          throw new Error('Server error (HTTP ' + resp.status + '). Check Render logs.');
+        }
+
+        const data = await resp.json();
+
+        finishProgress();
+
+        if (!resp.ok) {
+          progressSection.style.display = 'none';
+          uploadSection.style.display   = 'block';
+          showError(data.error || 'Unknown error.');
+          return;
+        }
+
+        // Succes
+        await new Promise(r => setTimeout(r, 400));
+        progressSection.style.display = 'none';
+        resultSection.style.display   = 'block';
+
+        renderMeta(data);
+        renderTotal(data);
+
+        downloadExcel.href     = '/download/' + data.token + '/excel';
+        downloadExcel.download = data.xlsx_name;
+        downloadCsv.href       = '/download/' + data.token + '/csv';
+        downloadCsv.download   = data.csv_name;
+
+        // Opruimen na downloads
+        downloadExcel.addEventListener('click', () => fetch('/done/' + data.token), { once: true });
+
+      } catch (err) {
+        finishProgress();
+        progressSection.style.display = 'none';
+        uploadSection.style.display   = 'block';
+        showError('Error: ' + err.message);
+      }
+    });
+
+    // ── New upload ─────────────────────────────────────────────────────────
+    newUploadBtn.addEventListener('click', () => {
+      resultSection.style.display  = 'none';
+      uploadSection.style.display  = 'block';
+      steps.forEach(s => document.getElementById(s).className = 'step');
+      progressBar.style.width = '0%';
+      clearFile();
+      hideError();
+    });
+  </script>
+</body>
+</html>
